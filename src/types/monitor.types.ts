@@ -3,6 +3,7 @@ export type CheckStatus =
   | "NO_SLOTS"
   | "SESSION_EXPIRED"
   | "REJECTED"
+  | "UNKNOWN"
   | "ERROR";
 
 export type NonErrorCheckStatus = Exclude<CheckStatus, "ERROR">;
@@ -48,4 +49,5 @@ export interface MonitorStats {
   consecutiveFailures: number;
   lastCheckAt: string | null;
   lastStatus: CheckStatus | null;
+  unknown: number;
 }

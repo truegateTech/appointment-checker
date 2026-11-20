@@ -28,6 +28,7 @@ const STATUS_BADGE: Record<NonErrorCheckStatus, string> = {
   NO_SLOTS: "ℹ️ NO SLOTS",
   SESSION_EXPIRED: "⏳ SESSION EXPIRED",
   REJECTED: "⛔ WAF REJECTED",
+  UNKNOWN: "❓ UNKNOWN PAGE",
 };
 
 class TelegramService {

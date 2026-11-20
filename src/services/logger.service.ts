@@ -38,6 +38,7 @@ class LoggerService {
       sessionExpired: 0,
       rejected: 0,
       errors: 0,
+      unknown: 0,
       consecutiveFailures: 0,
       lastCheckAt: null,
       lastStatus: null,
@@ -79,6 +80,10 @@ class LoggerService {
       case "REJECTED":
         this.stats.rejected += 1;
         this.stats.consecutiveFailures += 1;
+        break;
+      case "UNKNOWN":
+        this.stats.unknown = (this.stats.unknown ?? 0) + 1;
+        this.stats.consecutiveFailures = 0;
         break;
     }
 
