@@ -98,6 +98,19 @@ export class SlotPoller {
           details: entry.details,
           screenshotPath: result.screenshotPath,
         });
+      } else if (config.isDev) {
+        await telegram
+          .sendCheckStatusUpdate({
+            checkNumber: entry.checkNumber,
+            status: result.status,
+            applicantLabel: `${applicant.fullName} (${applicant.nie})`,
+            durationMs,
+            message: result.message,
+            url: result.url,
+          })
+          .catch((tgErr) =>
+            console.error("Failed to send dev status notification:", tgErr),
+          );
       } else if (
         result.status === "REJECTED" &&
         stats.consecutiveFailures === config.errorAlertThreshold
@@ -122,7 +135,11 @@ export class SlotPoller {
       const report = logger.recordError(error, Date.now() - startedAt);
       const stats = logger.getStats();
 
-      if (stats.consecutiveFailures === config.errorAlertThreshold) {
+      const shouldAlertError =
+        config.isDev ||
+        stats.consecutiveFailures === config.errorAlertThreshold;
+
+      if (shouldAlertError) {
         await telegram
           .sendFailureAlert({
             title: "NIE Slot Monitor Error Report",

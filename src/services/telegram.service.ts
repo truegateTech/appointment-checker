@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "@/config/env";
-import type { ErrorReport, MonitorStats } from "@/types/monitor.types";
+import type {
+  CheckStatus,
+  ErrorReport,
+  MonitorStats,
+} from "@/types/monitor.types";
 
 interface TelegramApiResponse {
   ok: boolean;
@@ -18,6 +22,17 @@ function escapeHtml(text = ""): string {
     .replaceAll(">", "&gt;");
 }
 
+function withEnvPrefix(htmlText: string): string {
+  return config.isDev ? `<code>[DEV]</code> ${htmlText}` : htmlText;
+}
+
+const STATUS_BADGE: Record<Exclude<CheckStatus, "ERROR">, string> = {
+  AVAILABLE: "🚨 AVAILABLE",
+  NO_SLOTS: "ℹ️ NO SLOTS",
+  SESSION_EXPIRED: "⏳ SESSION EXPIRED",
+  REJECTED: "⛔ WAF REJECTED",
+};
+
 class TelegramService {
   private readonly apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
   private lastSlotAlertAt = 0;
@@ -32,7 +47,7 @@ class TelegramService {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: config.telegramChatId,
-        text: htmlText.slice(0, 4000),
+        text: withEnvPrefix(htmlText).slice(0, 4000),
         parse_mode: "HTML",
         ...extra,
       }),
@@ -63,7 +78,7 @@ class TelegramService {
 
     form.append("chat_id", config.telegramChatId);
     form.append("photo", blob, path.basename(filePath));
-    form.append("caption", captionHtml.slice(0, 1000));
+    form.append("caption", withEnvPrefix(captionHtml).slice(0, 1000));
     form.append("parse_mode", "HTML");
     if (replyMarkup) {
       form.append("reply_markup", JSON.stringify(replyMarkup));
@@ -94,7 +109,8 @@ class TelegramService {
     const signature = `${params.message}|${params.url}`;
     const inCooldown = now - this.lastSlotAlertAt < config.alertCooldownMs;
 
-    if (inCooldown && signature === this.lastAlertSignature) {
+    // Bypass cooldown in dev so every test hit delivers immediately
+    if (!config.isDev && inCooldown && signature === this.lastAlertSignature) {
       return { skipped: true };
     }
 
@@ -135,6 +151,28 @@ class TelegramService {
     return { skipped: false };
   }
 
+  async sendCheckStatusUpdate(params: {
+    checkNumber: number;
+    status: Exclude<CheckStatus, "ERROR">;
+    applicantLabel: string;
+    durationMs: number;
+    message: string;
+    url: string;
+  }): Promise<void> {
+    const text = [
+      `<b>${STATUS_BADGE[params.status]}</b> (Check #${params.checkNumber})`,
+      `<b>Applicant:</b> ${escapeHtml(params.applicantLabel)}`,
+      `<b>Result:</b> ${escapeHtml(params.message)}`,
+      `<b>Duration:</b> ${(params.durationMs / 1000).toFixed(1)}s`,
+      `<a href="${escapeHtml(params.url)}">Portal Link</a>`,
+    ].join("\n");
+
+    await this.sendMessage(text, {
+      disable_notification: params.status === "NO_SLOTS",
+      disable_web_page_preview: true,
+    });
+  }
+
   async sendFailureAlert(params: {
     title: string;
     reason: string;
@@ -154,14 +192,23 @@ class TelegramService {
       .filter(Boolean)
       .join("\n");
 
+    const screenshotPath = params.errorReport?.screenshotPath;
+    if (config.isDev && screenshotPath && fs.existsSync(screenshotPath)) {
+      await this.sendPhoto(screenshotPath, text).catch(() =>
+        this.sendMessage(text),
+      );
+      return;
+    }
+
     await this.sendMessage(text);
   }
 
   async sendStartupNotice(stats: MonitorStats): Promise<void> {
     const text = [
-      "<b>✅ NIE Slot Monitor Started</b>",
+      `<b>✅ NIE Slot Monitor Started (${escapeHtml(config.nodeEnv)})</b>`,
       `<b>Portal:</b> ${escapeHtml(config.appointmentUrl)}`,
       `<b>Poll window:</b> ${config.pollMinMs / 1000}s – ${config.pollMaxMs / 1000}s`,
+      `<b>Verbose Telegram alerts:</b> ${config.isDev ? "ON (all checks)" : "OFF (slots & error threshold only)"}`,
       `<b>Logged checks so far:</b> ${stats.totalChecks}`,
     ].join("\n");
 
