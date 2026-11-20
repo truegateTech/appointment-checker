@@ -13,7 +13,9 @@ export interface PageError extends Error {
 
 class BrowserService {
   private browser: Browser | null = null;
-  private page: Page | null = null;
+  private pollingPage: Page | null = null;
+  private readonly lockedSlotPages = new WeakSet<Page>();
+  private isBusy = false;
 
   async connect(): Promise<Browser> {
     if (this.browser?.isConnected()) {
@@ -23,7 +25,7 @@ class BrowserService {
     this.browser = await chromium.connectOverCDP(config.cdpUrl);
     this.browser.on("disconnected", () => {
       this.browser = null;
-      this.page = null;
+      this.pollingPage = null;
     });
 
     return this.browser;
@@ -34,54 +36,64 @@ class BrowserService {
     return browser.contexts()[0] ?? (await browser.newContext());
   }
 
-  private async getOrCreatePage(targetUrl: string): Promise<Page> {
-    if (this.page && !this.page.isClosed()) {
-      return this.page;
+  private async getSinglePollingPage(targetUrl: string): Promise<Page> {
+    if (this.pollingPage && !this.pollingPage.isClosed()) {
+      return this.pollingPage;
     }
 
     const context = await this.getActiveContext();
-    if (!config.reuseTab) {
-      this.page = await context.newPage();
-      this.page.setDefaultTimeout(30_000);
-      return this.page;
+    const availablePages = context
+      .pages()
+      .filter((p) => !p.isClosed() && !this.lockedSlotPages.has(p));
+
+    if (config.reuseTab && availablePages.length > 0) {
+      let targetOrigin = "";
+      try {
+        targetOrigin = new URL(targetUrl).origin;
+      } catch {
+        // Ignore invalid URL
+      }
+
+      this.pollingPage =
+        (targetOrigin
+          ? availablePages.find((p) => p.url().startsWith(targetOrigin))
+          : undefined) ??
+        availablePages.find((p) => p.url() === "about:blank") ??
+        availablePages[0] ??
+        null;
     }
 
-    const openPages = context.pages().filter((p) => !p.isClosed());
-    let targetOrigin = "";
-    try {
-      targetOrigin = new URL(targetUrl).origin;
-    } catch {
-      // Fallback to first open tab
+    if (!this.pollingPage) {
+      this.pollingPage = await context.newPage();
     }
 
-    const reusable =
-      (targetOrigin
-        ? openPages.find((p) => p.url().startsWith(targetOrigin))
-        : undefined) ??
-      openPages.find((p) => p.url() === "about:blank") ??
-      openPages[0];
-
-    this.page = reusable ?? (await context.newPage());
-    this.page.setDefaultTimeout(30_000);
-    return this.page;
+    this.pollingPage.setDefaultTimeout(30_000);
+    return this.pollingPage;
   }
 
   async withPage<T>(
     targetUrl: string,
     taskFn: (page: Page) => Promise<{ result: T; keepTabOpen?: boolean }>,
   ): Promise<T> {
-    const page = await this.getOrCreatePage(targetUrl);
+    if (this.isBusy) {
+      throw new Error("BrowserService is already running a slot check.");
+    }
+
+    this.isBusy = true;
+    let page: Page | null = null;
 
     try {
+      page = await this.getSinglePollingPage(targetUrl);
       const outcome = await taskFn(page);
 
       if (outcome.keepTabOpen) {
-        // Leave this tab open for manual booking and detach it from future polls
+        // Preserve this tab for manual booking and detach it from future polls
+        this.lockedSlotPages.add(page);
         await page.bringToFront().catch(() => {});
-        this.page = null;
+        this.pollingPage = null;
       } else if (!config.reuseTab) {
         await page.close().catch(() => {});
-        this.page = null;
+        this.pollingPage = null;
       }
 
       return outcome.result;
@@ -89,7 +101,7 @@ class BrowserService {
       const error = (
         err instanceof Error ? err : new Error(String(err))
       ) as PageError;
-      if (!page.isClosed()) {
+      if (page && !page.isClosed()) {
         const screenshotPath = logger.getScreenshotPath("error");
         await page
           .screenshot({ path: screenshotPath, fullPage: true })
@@ -97,17 +109,19 @@ class BrowserService {
         error.screenshotPath = screenshotPath;
         if (!config.reuseTab) {
           await page.close().catch(() => {});
-          this.page = null;
+          this.pollingPage = null;
         }
       } else {
-        this.page = null;
+        this.pollingPage = null;
       }
       throw error;
+    } finally {
+      this.isBusy = false;
     }
   }
 
   async disconnect(): Promise<void> {
-    this.page = null;
+    this.pollingPage = null;
     if (this.browser) {
       await this.browser.close().catch(() => {});
       this.browser = null;

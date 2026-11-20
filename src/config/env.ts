@@ -18,6 +18,10 @@ export interface AppConfig {
   errorAlertThreshold: number;
   telegramChatId: string; // Admin / default chat ID
   allowedChatIds: string[];
+  webhookUrl: string | null;
+  webhookPath: string;
+  webhookPort: number;
+  webhookSecret: string | null;
 }
 
 const adminChatId = isDev
@@ -49,6 +53,11 @@ export const config: AppConfig = {
   pollMaxMs: intEnv("POLL_MAX_SEC", 60) * 1000,
   alertCooldownMs: intEnv("ALERT_COOLDOWN_SEC", 300) * 1000,
   errorAlertThreshold: intEnv("ERROR_ALERT_THRESHOLD", 5),
+  webhookUrl:
+    process.env.TELEGRAM_WEBHOOK_URL?.trim().replace(/\/+$/, "") || null,
+  webhookPath: process.env.TELEGRAM_WEBHOOK_PATH?.trim() || "/telegram/webhook",
+  webhookPort: intEnv("TELEGRAM_WEBHOOK_PORT", 3001),
+  webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET?.trim() || null,
 };
 
 if (config.pollMinMs > config.pollMaxMs) {

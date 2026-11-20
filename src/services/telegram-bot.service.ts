@@ -26,17 +26,17 @@ class TelegramBotService {
     return config.allowedChatIds.includes(chatId);
   }
 
-  start(): void {
-    if (this.running) return;
-    this.running = true;
-    void this.pollLoop();
-    console.log("Telegram Bot command listener started.");
-  }
+  //   start(): void {
+  //     if (this.running) return;
+  //     this.running = true;
+  //     void this.pollLoop();
+  //     console.log("Telegram Bot command listener started.");
+  //   }
 
-  stop(): void {
-    this.running = false;
-    this.abortController?.abort();
-  }
+  //   stop(): void {
+  //     this.running = false;
+  //     this.abortController?.abort();
+  //   }
 
   private async send(
     chatId: string,
@@ -52,31 +52,31 @@ class TelegramBotService {
     });
   }
 
-  private async pollLoop(): Promise<void> {
-    while (this.running) {
-      try {
-        this.abortController = new AbortController();
-        const updates = await telegram.getUpdates(
-          this.offset,
-          this.abortController.signal,
-        );
+  //   private async pollLoop(): Promise<void> {
+  //     while (this.running) {
+  //       try {
+  //         this.abortController = new AbortController();
+  //         const updates = await telegram.getUpdates(
+  //           this.offset,
+  //           this.abortController.signal,
+  //         );
 
-        for (const update of updates) {
-          this.offset = update.update_id + 1;
-          await this.handleUpdate(update).catch((err: unknown) =>
-            console.error("Bot update error:", err),
-          );
-        }
-      } catch (err: unknown) {
-        if (!this.running) break;
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn("Telegram getUpdates retry in 3s:", msg);
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-    }
-  }
+  //         for (const update of updates) {
+  //           this.offset = update.update_id + 1;
+  //           await this.handleUpdate(update).catch((err: unknown) =>
+  //             console.error("Bot update error:", err),
+  //           );
+  //         }
+  //       } catch (err: unknown) {
+  //         if (!this.running) break;
+  //         const msg = err instanceof Error ? err.message : String(err);
+  //         console.warn("Telegram getUpdates retry in 3s:", msg);
+  //         await new Promise((r) => setTimeout(r, 3000));
+  //       }
+  //     }
+  //   }
 
-  private async handleUpdate(update: TelegramUpdate): Promise<void> {
+  async handleUpdate(update: TelegramUpdate): Promise<void> {
     const incomingChatId = update.callback_query?.message?.chat.id
       ? String(update.callback_query.message.chat.id)
       : update.message?.chat.id

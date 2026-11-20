@@ -59,25 +59,18 @@ class TelegramService {
     return data.result;
   }
 
-  async getUpdates(
-    offset: number,
-    signal?: AbortSignal,
-  ): Promise<TelegramUpdate[]> {
-    const response = await fetch(
-      `${this.apiBase}/getUpdates?timeout=30&offset=${offset}`,
-      { signal },
-    );
-    const data = (await response.json()) as TelegramApiResponse<
-      TelegramUpdate[]
-    >;
+  async setWebhook(url: string, secretToken?: string | null): Promise<boolean> {
+    return this.callApi<boolean>("setWebhook", {
+      url,
+      allowed_updates: ["message", "callback_query"],
+      ...(secretToken ? { secret_token: secretToken } : {}),
+    });
+  }
 
-    if (!response.ok || !data.ok) {
-      throw new Error(
-        `Telegram getUpdates error ${data.error_code ?? response.status}: ${data.description ?? "Unknown"}`,
-      );
-    }
-
-    return data.result ?? [];
+  async deleteWebhook(dropPendingUpdates = false): Promise<boolean> {
+    return this.callApi<boolean>("deleteWebhook", {
+      drop_pending_updates: dropPendingUpdates,
+    });
   }
 
   async answerCallbackQuery(callbackQueryId: string): Promise<void> {
