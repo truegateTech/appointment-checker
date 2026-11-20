@@ -17,11 +17,13 @@
     "codegen:nie": "playwright codegen --channel=chrome --lang=es-ES --timezone=Europe/Madrid"
   },
   "dependencies": {
+    "better-sqlite3": "^13.2.0",
     "dotenv": "^16.4.7",
     "playwright": "^1.49.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.10.0",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
