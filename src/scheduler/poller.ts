@@ -1,6 +1,7 @@
 import { checkNieSlots } from "@/checkers/slot-checker";
 import { config } from "@/config/env";
 import type { PageError } from "@/services/browser.service";
+import { dbService } from "@/services/db.service";
 import { logger } from "@/services/logger.service";
 import { telegram } from "@/services/telegram.service";
 import type { CheckStatus } from "@/types/monitor.types";
@@ -11,6 +12,7 @@ const MAX_BACKOFF_MS = 10 * 60 * 1000;
 export class SlotPoller {
   private running = false;
   private timer: NodeJS.Timeout | null = null;
+  private cursor = 0;
 
   start(): void {
     if (this.running) return;
@@ -24,6 +26,14 @@ export class SlotPoller {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  private scheduleNext(delayMs: number): void {
+    if (!this.running) return;
+    console.log(`Next check in ${(delayMs / 1000).toFixed(1)}s...`);
+    this.timer = setTimeout(() => {
+      void this.runCycle();
+    }, delayMs);
   }
 
   private computeNextDelayMs(
@@ -47,15 +57,37 @@ export class SlotPoller {
   private async runCycle(): Promise<void> {
     if (!this.running) return;
 
+    const applicants = dbService.getActiveApplicants();
+    if (applicants.length === 0) {
+      console.log(
+        "No active applicants in SQLite DB. Waiting for next tick...",
+      );
+      this.scheduleNext(randomInt(config.pollMinMs, config.pollMaxMs));
+      return;
+    }
+
+    const applicant = applicants[this.cursor % applicants.length];
+    this.cursor = (this.cursor + 1) % applicants.length;
+
     const startedAt = Date.now();
     let lastStatus: CheckStatus = "NO_SLOTS";
 
     try {
-      const result = await checkNieSlots();
+      const result = await checkNieSlots(applicant);
       const durationMs = Date.now() - startedAt;
       lastStatus = result.status;
 
-      const entry = logger.recordCheck(result, durationMs);
+      dbService.recordApplicantCheck(applicant.id, result.status);
+
+      const entry = logger.recordCheck(
+        {
+          ...result,
+          details: `Applicant: ${applicant.fullName} (${applicant.nie})${
+            result.details ? ` | ${result.details}` : ""
+          }`,
+        },
+        durationMs,
+      );
       const stats = logger.getStats();
 
       if (result.status === "AVAILABLE") {
@@ -63,7 +95,7 @@ export class SlotPoller {
           checkNumber: entry.checkNumber,
           message: result.message,
           url: result.url,
-          details: result.details,
+          details: entry.details,
           screenshotPath: result.screenshotPath,
         });
       } else if (
@@ -82,6 +114,8 @@ export class SlotPoller {
       }
     } catch (err) {
       lastStatus = "ERROR";
+      dbService.recordApplicantCheck(applicant.id, "ERROR");
+
       const error = (
         err instanceof Error ? err : new Error(String(err))
       ) as PageError;
@@ -92,7 +126,7 @@ export class SlotPoller {
         await telegram
           .sendFailureAlert({
             title: "NIE Slot Monitor Error Report",
-            reason: report.message,
+            reason: `[${applicant.nie}] ${report.message}`,
             stats,
             errorReport: report,
           })
@@ -102,11 +136,11 @@ export class SlotPoller {
       }
     }
 
-    if (!this.running) return;
-
     const { consecutiveFailures } = logger.getStats();
     const delayMs = this.computeNextDelayMs(lastStatus, consecutiveFailures);
-    console.log(`Next check in ${(delayMs / 1000).toFixed(1)}s...`);
+    this.scheduleNext(delayMs);
+
+    if (!this.running) return;
 
     this.timer = setTimeout(() => {
       void this.runCycle();

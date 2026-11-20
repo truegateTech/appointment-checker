@@ -4,6 +4,7 @@ import { browserService } from "@/services/browser.service";
 import { logger } from "@/services/logger.service";
 import type { SlotCheckResult } from "@/types/monitor.types";
 import { humanClick, humanPause, humanType } from "@/utils/human";
+import { Applicant } from "@/types/applicant.types";
 
 const NO_SLOTS_MESSAGES = [
   "En este momento no hay citas disponibles.\n\nEn breve, la Oficina pondrá a su disposición nuevas citas.",
@@ -48,7 +49,9 @@ function rejectedResult(page: Page, step: string): SlotCheckResult {
   };
 }
 
-export async function checkNieSlots(): Promise<SlotCheckResult> {
+export async function checkNieSlots(
+  applicant: Applicant,
+): Promise<SlotCheckResult> {
   return browserService.withPage<SlotCheckResult>(async (page) => {
     await page.goto(config.appointmentUrl, { waitUntil: "domcontentloaded" });
     if (await isRejected(page)) {
@@ -67,7 +70,7 @@ export async function checkNieSlots(): Promise<SlotCheckResult> {
     const procedureSelect = page.getByLabel("TRÁMITES POLICÍA NACIONAL");
     await humanClick(page, procedureSelect);
     await humanPause(300, 700);
-    await procedureSelect.selectOption(config.procedureCode);
+    await procedureSelect.selectOption(applicant.procedureCode);
     await humanPause(700, 1500);
 
     await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
@@ -91,20 +94,20 @@ export async function checkNieSlots(): Promise<SlotCheckResult> {
       name: "* N.I.E. Campo obligatorio",
     });
     await humanClick(page, nieInput);
-    await humanType(nieInput, config.nie);
+    await humanType(nieInput, applicant.nie);
     await humanPause(500, 1100);
 
     const nameInput = page.getByRole("textbox", {
       name: "*Nombre y apellidos Campo",
     });
     await humanClick(page, nameInput);
-    await humanType(nameInput, config.fullName);
+    await humanType(nameInput, applicant.fullName);
     await humanPause(500, 1200);
 
     const countrySelect = page.getByLabel("País de nacionalidad");
     await humanClick(page, countrySelect);
     await humanPause(300, 750);
-    await countrySelect.selectOption(config.nationalityCode);
+    await countrySelect.selectOption(applicant.nationalityCode);
     await humanPause(800, 1700);
 
     await humanClick(page, page.getByRole("button", { name: "Aceptar" }));

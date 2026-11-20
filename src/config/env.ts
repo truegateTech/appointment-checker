@@ -3,10 +3,6 @@ import { boolEnv, intEnv, requiredEnv } from "@/utils/env";
 
 export interface AppConfig {
   appointmentUrl: string;
-  nie: string;
-  fullName: string;
-  nationalityCode: string;
-  procedureCode: string;
   cdpUrl: string;
   keepTabOnSlot: boolean;
   telegramBotToken: string;
@@ -20,10 +16,6 @@ export interface AppConfig {
 export const config: AppConfig = {
   appointmentUrl:
     process.env.APPOINTMENT_URL?.trim() || "http://localhost:3000",
-  nie: requiredEnv("NIE"),
-  fullName: requiredEnv("FULL_NAME"),
-  nationalityCode: requiredEnv("NATIONALITY_CODE"),
-  procedureCode: process.env.PROCEDURE_CODE?.trim() || "4010",
   cdpUrl: process.env.CDP_URL?.trim() || "http://127.0.0.1:9222",
   keepTabOnSlot: boolEnv("KEEP_TAB_ON_SLOT", true),
   telegramBotToken: requiredEnv("TELEGRAM_BOT_TOKEN"),
