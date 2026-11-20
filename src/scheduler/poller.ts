@@ -6,6 +6,11 @@ import { logger } from "@/services/logger.service";
 import { telegram } from "@/services/telegram.service";
 import type { CheckStatus } from "@/types/monitor.types";
 import { randomInt } from "@/utils/human";
+import {
+  getActiveWindowStatus,
+  getMadridDateKey,
+  getMsUntilNextMadridDay,
+} from "@/utils/schedule";
 
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
@@ -14,6 +19,7 @@ export class SlotPoller {
   private inFlight = false;
   private timer: NodeJS.Timeout | null = null;
   private cursor = 0;
+  private notifiedDailyCapDate: string | null = null;
 
   start(): void {
     if (this.running) return;
@@ -66,8 +72,41 @@ export class SlotPoller {
 
     let lastStatus: CheckStatus = "NO_SLOTS";
     let ranCheck = false;
+    let overrideDelayMs: number | null = null;
 
     try {
+      // 1. Enforce Madrid active hours: 07:30–22:00 weekdays, 09:00–22:00 weekends
+      const windowStatus = getActiveWindowStatus();
+      if (!windowStatus.isActive) {
+        console.log(`[Schedule] ${windowStatus.reason}. Sleeping...`);
+        overrideDelayMs = windowStatus.waitMs;
+        return;
+      }
+
+      // 2. Enforce daily submission cap to avoid the portal's silent 5-tries/day shadow-limit
+      if (config.maxDailyChecks > 0) {
+        const checksToday = logger.getChecksToday();
+        if (checksToday >= config.maxDailyChecks) {
+          const todayKey = getMadridDateKey();
+          console.log(
+            `[Rate Guard] Daily cap reached (${checksToday}/${config.maxDailyChecks}) for ${todayKey}. Waiting for next Madrid day...`,
+          );
+
+          if (this.notifiedDailyCapDate !== todayKey) {
+            this.notifiedDailyCapDate = todayKey;
+            await telegram
+              .sendMessage(
+                `<b>🛑 Daily Check Cap Reached (${checksToday}/${config.maxDailyChecks})</b>\nPaused until tomorrow's Madrid window to avoid the portal's 5-tries/day silent limit.`,
+                { disable_notification: true },
+              )
+              .catch(() => {});
+          }
+
+          overrideDelayMs = getMsUntilNextMadridDay();
+          return;
+        }
+      }
+
       const applicants = dbService.getActiveApplicants();
       if (applicants.length === 0) {
         console.log(
@@ -183,12 +222,14 @@ export class SlotPoller {
     } finally {
       this.inFlight = false;
       if (this.running) {
-        const delayMs = ranCheck
-          ? this.computeNextDelayMs(
-              lastStatus,
-              logger.getStats().consecutiveFailures,
-            )
-          : randomInt(config.pollMinMs, config.pollMaxMs);
+        const delayMs =
+          overrideDelayMs ??
+          (ranCheck
+            ? this.computeNextDelayMs(
+                lastStatus,
+                logger.getStats().consecutiveFailures,
+              )
+            : randomInt(config.pollMinMs, config.pollMaxMs));
         this.scheduleNext(delayMs);
       }
     }

@@ -50,4 +50,6 @@ export interface MonitorStats {
   lastCheckAt: string | null;
   lastStatus: CheckStatus | null;
   unknown: number;
+  dailyDate: string;
+  checksToday: number;
 }

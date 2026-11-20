@@ -22,6 +22,7 @@ export interface AppConfig {
   webhookPath: string;
   webhookPort: number;
   webhookSecret: string | null;
+  maxDailyChecks: number;
 }
 
 const adminChatId = isDev
@@ -37,6 +38,10 @@ const allowedChatIds =
   parsedAllowed.length > 0
     ? Array.from(new Set([adminChatId, ...parsedAllowed]))
     : [];
+
+const rawMaxDaily = Number.parseInt(process.env.MAX_CHECKS_PER_DAY ?? "5", 10);
+const maxDailyChecks =
+  Number.isFinite(rawMaxDaily) && rawMaxDaily >= 0 ? rawMaxDaily : 5;
 
 export const config: AppConfig = {
   nodeEnv,
@@ -58,6 +63,7 @@ export const config: AppConfig = {
   webhookPath: process.env.TELEGRAM_WEBHOOK_PATH?.trim() || "/telegram/webhook",
   webhookPort: intEnv("TELEGRAM_WEBHOOK_PORT", 3001),
   webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET?.trim() || null,
+  maxDailyChecks,
 };
 
 if (config.pollMinMs > config.pollMaxMs) {

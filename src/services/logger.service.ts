@@ -6,6 +6,7 @@ import type {
   MonitorStats,
   SlotCheckResult,
 } from "@/types/monitor.types";
+import { getMadridDateKey } from "@/utils/schedule";
 
 const LOG_DIR = path.resolve("logs");
 const SCREENSHOT_DIR = path.join(LOG_DIR, "screenshots");
@@ -19,17 +20,10 @@ class LoggerService {
   constructor() {
     fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
     this.stats = this.loadStats();
+    this.syncDailyCounter();
   }
 
-  private loadStats(): MonitorStats {
-    if (fs.existsSync(STATS_FILE)) {
-      try {
-        return JSON.parse(fs.readFileSync(STATS_FILE, "utf8")) as MonitorStats;
-      } catch {
-        // Fallback to fresh stats if JSON is unreadable
-      }
-    }
-
+  private createDefaultStats(): MonitorStats {
     return {
       startedAt: new Date().toISOString(),
       totalChecks: 0,
@@ -37,12 +31,34 @@ class LoggerService {
       noSlots: 0,
       sessionExpired: 0,
       rejected: 0,
-      errors: 0,
       unknown: 0,
+      errors: 0,
       consecutiveFailures: 0,
       lastCheckAt: null,
       lastStatus: null,
+      dailyDate: getMadridDateKey(),
+      checksToday: 0,
     };
+  }
+
+  private loadStats(): MonitorStats {
+    const defaults = this.createDefaultStats();
+
+    if (fs.existsSync(STATS_FILE)) {
+      try {
+        const parsed = JSON.parse(
+          fs.readFileSync(STATS_FILE, "utf8"),
+        ) as Partial<MonitorStats>;
+        return {
+          ...defaults,
+          ...parsed,
+        };
+      } catch {
+        // Fallback to clean stats if stats.json is corrupted
+      }
+    }
+
+    return defaults;
   }
 
   private saveStats(): void {
@@ -53,12 +69,28 @@ class LoggerService {
     fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`, "utf8");
   }
 
+  private syncDailyCounter(): void {
+    const today = getMadridDateKey();
+    if (this.stats.dailyDate !== today) {
+      this.stats.dailyDate = today;
+      this.stats.checksToday = 0;
+      this.saveStats();
+    }
+  }
+
   getScreenshotPath(prefix: string): string {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     return path.join(SCREENSHOT_DIR, `${prefix}-${stamp}.png`);
   }
 
+  getChecksToday(): number {
+    this.syncDailyCounter();
+    return this.stats.checksToday;
+  }
+
   recordCheck(result: SlotCheckResult, durationMs: number): CheckLogEntry {
+    this.syncDailyCounter();
+
     const timestamp = new Date().toISOString();
     this.stats.totalChecks += 1;
     this.stats.lastCheckAt = timestamp;
@@ -77,14 +109,19 @@ class LoggerService {
         this.stats.sessionExpired += 1;
         this.stats.consecutiveFailures = 0;
         break;
+      case "UNKNOWN":
+        this.stats.unknown += 1;
+        this.stats.consecutiveFailures = 0;
+        break;
       case "REJECTED":
         this.stats.rejected += 1;
         this.stats.consecutiveFailures += 1;
         break;
-      case "UNKNOWN":
-        this.stats.unknown = (this.stats.unknown ?? 0) + 1;
-        this.stats.consecutiveFailures = 0;
-        break;
+    }
+
+    // Count completed form submissions toward the portal's daily limit
+    if (result.status !== "REJECTED") {
+      this.stats.checksToday += 1;
     }
 
     const entry: CheckLogEntry = {
@@ -104,7 +141,7 @@ class LoggerService {
     this.saveStats();
 
     console.log(
-      `[${timestamp}] #${entry.checkNumber} ${entry.status} (${durationMs}ms) — ${entry.message}`,
+      `[${timestamp}] #${entry.checkNumber} ${entry.status} (${durationMs}ms | today: ${this.stats.checksToday}) — ${entry.message}`,
     );
 
     return entry;
@@ -114,6 +151,8 @@ class LoggerService {
     error: Error & { screenshotPath?: string },
     durationMs: number,
   ): ErrorReport {
+    this.syncDailyCounter();
+
     const timestamp = new Date().toISOString();
     this.stats.totalChecks += 1;
     this.stats.errors += 1;
@@ -143,6 +182,7 @@ class LoggerService {
   }
 
   getStats(): MonitorStats {
+    this.syncDailyCounter();
     return { ...this.stats };
   }
 }
