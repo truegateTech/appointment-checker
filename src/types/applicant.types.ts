@@ -10,8 +10,6 @@ export interface Applicant {
   procedureCode: string;
   procedureName: string;
   procedureGroup: string;
-  nationalityCode: string;
-  nationalityName: string;
   chatId: string | null;
   isActive: boolean;
   lastStatus: CheckStatus | null;
@@ -28,7 +26,5 @@ export interface CreateApplicantInput {
   procedureCode: string;
   procedureName: string;
   procedureGroup: string;
-  nationalityCode: string;
-  nationalityName: string;
   chatId?: string;
 }

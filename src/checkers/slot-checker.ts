@@ -5,7 +5,6 @@ import { logger } from "@/services/logger.service";
 import type { Applicant } from "@/types/applicant.types";
 import type { SlotCheckResult } from "@/types/monitor.types";
 import { humanClick, humanPause, humanType } from "@/utils/human";
-import { normalizeText } from "@/utils/normalize";
 
 const NO_SLOTS_MESSAGES = [
   "En este momento no hay citas disponibles.\n\nEn breve, la Oficina pondrá a su disposición nuevas citas.",
@@ -57,47 +56,47 @@ function rejectedResult(page: Page, step: string): SlotCheckResult {
   };
 }
 
-async function selectNationality(
-  page: Page,
-  applicant: Applicant,
-): Promise<void> {
-  const countrySelect = page.locator("#txtPaisNac");
-  await countrySelect.waitFor({ state: "visible", timeout: 20_000 });
+// async function selectNationality(
+//   page: Page,
+//   applicant: Applicant,
+// ): Promise<void> {
+//   const countrySelect = page.locator("#txtPaisNac");
+//   await countrySelect.waitFor({ state: "visible", timeout: 20_000 });
 
-  const options = await countrySelect.locator("option").evaluateAll((opts) =>
-    opts.map((opt) => {
-      const el = opt as HTMLOptionElement;
-      return {
-        value: el.value.trim(),
-        label: (el.textContent ?? "").trim(),
-      };
-    }),
-  );
+//   const options = await countrySelect.locator("option").evaluateAll((opts) =>
+//     opts.map((opt) => {
+//       const el = opt as HTMLOptionElement;
+//       return {
+//         value: el.value.trim(),
+//         label: (el.textContent ?? "").trim(),
+//       };
+//     }),
+//   );
 
-  const codeCandidate = applicant.nationalityCode.trim();
-  const nameCandidate = normalizeText(
-    applicant.nationalityName || applicant.nationalityCode,
-  );
+//   const codeCandidate = applicant.nationalityCode.trim();
+//   const nameCandidate = normalizeText(
+//     applicant.nationalityName || applicant.nationalityCode,
+//   );
 
-  const matched =
-    options.find((opt) => opt.value === codeCandidate) ??
-    options.find((opt) => normalizeText(opt.label) === nameCandidate) ??
-    options.find(
-      (opt) =>
-        nameCandidate.length >= 3 &&
-        normalizeText(opt.label).includes(nameCandidate),
-    );
+//   const matched =
+//     options.find((opt) => opt.value === codeCandidate) ??
+//     options.find((opt) => normalizeText(opt.label) === nameCandidate) ??
+//     options.find(
+//       (opt) =>
+//         nameCandidate.length >= 3 &&
+//         normalizeText(opt.label).includes(nameCandidate),
+//     );
 
-  if (!matched) {
-    throw new Error(
-      `Nationality "${applicant.nationalityCode}" (${applicant.nationalityName || "no name"}) not found in #txtPaisNac (${options.length} options loaded).`,
-    );
-  }
+//   if (!matched) {
+//     throw new Error(
+//       `Nationality "${applicant.nationalityCode}" (${applicant.nationalityName || "no name"}) not found in #txtPaisNac (${options.length} options loaded).`,
+//     );
+//   }
 
-  await humanClick(page, countrySelect);
-  await humanPause(300, 750);
-  await countrySelect.selectOption(matched.value);
-}
+//   await humanClick(page, countrySelect);
+//   await humanPause(300, 750);
+//   await countrySelect.selectOption(matched.value);
+// }
 
 async function findProcedureSelect(
   page: Page,
@@ -260,10 +259,7 @@ export async function checkNieSlots(
     });
     await humanClick(page, nameInput);
     await humanType(nameInput, applicant.fullName);
-    await humanPause(500, 1200);
-
-    await selectNationality(page, applicant);
-    await humanPause(800, 1700);
+    await humanPause(700, 1500);
 
     await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
     await page.waitForLoadState("domcontentloaded");

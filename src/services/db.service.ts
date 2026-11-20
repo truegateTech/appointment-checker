@@ -16,8 +16,6 @@ interface ApplicantRow {
   procedure_code: string;
   procedure_name: string;
   procedure_group: string;
-  nationality_code: string;
-  nationality_name: string;
   chat_id: string | null;
   is_active: number;
   last_status: CheckStatus | null;
@@ -36,8 +34,6 @@ function mapRow(row: ApplicantRow): Applicant {
     procedureCode: row.procedure_code,
     procedureName: row.procedure_name,
     procedureGroup: row.procedure_group,
-    nationalityCode: row.nationality_code,
-    nationalityName: row.nationality_name,
     chatId: row.chat_id,
     isActive: row.is_active === 1,
     lastStatus: row.last_status,
@@ -53,6 +49,7 @@ class DbService {
     fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
     this.db = new Database(DB_PATH);
     this.db.pragma("journal_mode = WAL");
+    this.db.pragma("busy_timeout = 5000");
     this.initSchema();
   }
 
@@ -67,9 +64,7 @@ class DbService {
         province_url TEXT NOT NULL DEFAULT 'https://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8&locale=es',
         procedure_code TEXT NOT NULL DEFAULT '4010',
         procedure_name TEXT NOT NULL DEFAULT 'POLICIA-TOMA DE HUELLAS',
-        procedure_group TEXT NOT NULL DEFAULT 'tramiteGrupo[1]',
-        nationality_code TEXT NOT NULL,
-        nationality_name TEXT NOT NULL DEFAULT '',
+        procedure_group TEXT NOT NULL DEFAULT 'tramiteGrupo[0]',
         chat_id TEXT,
         is_active INTEGER NOT NULL DEFAULT 1,
         last_status TEXT,
@@ -78,27 +73,15 @@ class DbService {
       );
     `);
 
-    // Add new columns safely if upgrading an older database
     const cols = this.db.prepare("PRAGMA table_info(applicants)").all() as {
       name: string;
     }[];
     const names = new Set(cols.map((c) => c.name));
 
-    const migrations: [string, string][] = [
-      ["province_code", "TEXT NOT NULL DEFAULT '8'"],
-      ["province_name", "TEXT NOT NULL DEFAULT 'Barcelona'"],
-      [
-        "province_url",
-        "TEXT NOT NULL DEFAULT 'https://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8&locale=es'",
-      ],
-      ["procedure_name", "TEXT NOT NULL DEFAULT 'POLICIA-TOMA DE HUELLAS'"],
-      ["procedure_group", "TEXT NOT NULL DEFAULT 'tramiteGrupo[1]'"],
-      ["nationality_name", "TEXT NOT NULL DEFAULT ''"],
-    ];
-
-    for (const [col, def] of migrations) {
-      if (!names.has(col)) {
-        this.db.exec(`ALTER TABLE applicants ADD COLUMN ${col} ${def}`);
+    // Drop legacy nationality columns if upgrading an existing monitor.db
+    for (const obsoleteCol of ["nationality_code", "nationality_name"]) {
+      if (names.has(obsoleteCol)) {
+        this.db.exec(`ALTER TABLE applicants DROP COLUMN ${obsoleteCol}`);
       }
     }
   }
@@ -107,13 +90,11 @@ class DbService {
     const stmt = this.db.prepare(`
       INSERT INTO applicants (
         full_name, nie, province_code, province_name, province_url,
-        procedure_code, procedure_name, procedure_group,
-        nationality_code, nationality_name, chat_id, is_active
+        procedure_code, procedure_name, procedure_group, chat_id, is_active
       )
       VALUES (
         @fullName, @nie, @provinceCode, @provinceName, @provinceUrl,
-        @procedureCode, @procedureName, @procedureGroup,
-        @nationalityCode, @nationalityName, @chatId, 1
+        @procedureCode, @procedureName, @procedureGroup, @chatId, 1
       )
       RETURNING *
     `);
@@ -127,8 +108,6 @@ class DbService {
       procedureCode: input.procedureCode,
       procedureName: input.procedureName,
       procedureGroup: input.procedureGroup,
-      nationalityCode: input.nationalityCode,
-      nationalityName: input.nationalityName,
       chatId: input.chatId?.trim() || null,
     }) as ApplicantRow;
 

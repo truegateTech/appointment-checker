@@ -77,7 +77,6 @@ export interface FailureAlertParams {
 export type WizardStep =
   | "PROVINCE"
   | "PROCEDURE"
-  | "COUNTRY"
   | "NIE"
   | "FULL_NAME"
   | "CONFIRM";
@@ -90,8 +89,6 @@ export interface WizardDraft {
   procedureCode?: string;
   procedureName?: string;
   procedureGroup?: string;
-  nationalityCode?: string;
-  nationalityName?: string;
   nie?: string;
   fullName?: string;
 }

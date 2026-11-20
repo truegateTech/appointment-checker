@@ -12,9 +12,6 @@ import type {
 const PAGE_SIZE = 6;
 
 class TelegramBotService {
-  private running = false;
-  private offset = 0;
-  private abortController: AbortController | null = null;
   private readonly drafts = new Map<string, WizardDraft>();
 
   private isAdmin(chatId: string): boolean {
@@ -25,18 +22,6 @@ class TelegramBotService {
     if (config.allowedChatIds.length === 0) return true;
     return config.allowedChatIds.includes(chatId);
   }
-
-  //   start(): void {
-  //     if (this.running) return;
-  //     this.running = true;
-  //     void this.pollLoop();
-  //     console.log("Telegram Bot command listener started.");
-  //   }
-
-  //   stop(): void {
-  //     this.running = false;
-  //     this.abortController?.abort();
-  //   }
 
   private async send(
     chatId: string,
@@ -51,30 +36,6 @@ class TelegramBotService {
         : {}),
     });
   }
-
-  //   private async pollLoop(): Promise<void> {
-  //     while (this.running) {
-  //       try {
-  //         this.abortController = new AbortController();
-  //         const updates = await telegram.getUpdates(
-  //           this.offset,
-  //           this.abortController.signal,
-  //         );
-
-  //         for (const update of updates) {
-  //           this.offset = update.update_id + 1;
-  //           await this.handleUpdate(update).catch((err: unknown) =>
-  //             console.error("Bot update error:", err),
-  //           );
-  //         }
-  //       } catch (err: unknown) {
-  //         if (!this.running) break;
-  //         const msg = err instanceof Error ? err.message : String(err);
-  //         console.warn("Telegram getUpdates retry in 3s:", msg);
-  //         await new Promise((r) => setTimeout(r, 3000));
-  //       }
-  //     }
-  //   }
 
   async handleUpdate(update: TelegramUpdate): Promise<void> {
     const incomingChatId = update.callback_query?.message?.chat.id
@@ -108,7 +69,6 @@ class TelegramBotService {
     const text = update.message?.text?.trim();
     if (!text) return;
 
-    // Normalize commands and strip @bot_username suffix when triggered in groups
     const command = text.split(/\s+/)[0]?.split("@")[0]?.toLowerCase();
 
     if (command === "/start" || command === "/help") {
@@ -147,7 +107,7 @@ class TelegramBotService {
           "<b>📊 Monitor Stats</b>",
           `Total checks: <b>${s.totalChecks}</b>`,
           `Slots found: <b>${s.slotsAvailable}</b>`,
-          `No slots: ${s.noSlots} | Expired: ${s.sessionExpired}`,
+          `No slots: ${s.noSlots} | Expired: ${s.sessionExpired} | Unknown: ${s.unknown ?? 0}`,
           `WAF rejected: ${s.rejected} | Errors: ${s.errors}`,
           `Last status: <code>${s.lastStatus ?? "N/A"}</code>`,
         ].join("\n"),
@@ -191,7 +151,7 @@ class TelegramBotService {
     }
     if (nav.length > 0) rows.push(nav);
 
-    await this.send(chatId, "<b>Step 1/5 — Select Province:</b>", rows);
+    await this.send(chatId, "<b>Step 1/4 — Select Province:</b>", rows);
   }
 
   private async showProcedurePicker(
@@ -223,7 +183,7 @@ class TelegramBotService {
 
     await this.send(
       chatId,
-      `<b>Step 2/5 — Select Procedure for ${escapeHtml(prov.name)}:</b>`,
+      `<b>Step 2/4 — Select Procedure for ${escapeHtml(prov.name)}:</b>`,
       rows,
     );
   }
@@ -263,25 +223,11 @@ class TelegramBotService {
       draft.procedureCode = proc.code;
       draft.procedureName = proc.name;
       draft.procedureGroup = proc.selectName;
-      draft.step = "COUNTRY";
-
-      await this.send(
-        chatId,
-        "<b>Step 3/5 — Applicant Nationality</b>\nType your country name (e.g. <code>India</code>, <code>Colombia</code>, <code>Argentina</code>) to search:",
-      );
-      return;
-    }
-
-    if (action === "nat" && draft) {
-      const country = catalogService.getCountry(value);
-      if (!country) return;
-      draft.nationalityCode = country.code;
-      draft.nationalityName = country.name;
       draft.step = "NIE";
 
       await this.send(
         chatId,
-        `Selected: <b>${escapeHtml(country.name)}</b>\n\n<b>Step 4/5 — Enter NIE / Passport number:</b>`,
+        `Selected: <b>${escapeHtml(proc.name)}</b>\n\n<b>Step 3/4 — Enter NIE / Passport number:</b>`,
       );
       return;
     }
@@ -295,9 +241,7 @@ class TelegramBotService {
         !draft.provinceUrl ||
         !draft.procedureCode ||
         !draft.procedureName ||
-        !draft.procedureGroup ||
-        !draft.nationalityCode ||
-        !draft.nationalityName
+        !draft.procedureGroup
       ) {
         await this.send(
           chatId,
@@ -316,8 +260,6 @@ class TelegramBotService {
         procedureCode: draft.procedureCode,
         procedureName: draft.procedureName,
         procedureGroup: draft.procedureGroup,
-        nationalityCode: draft.nationalityCode,
-        nationalityName: draft.nationalityName,
         chatId,
       });
       this.drafts.delete(chatId);
@@ -360,25 +302,12 @@ class TelegramBotService {
     const draft = this.drafts.get(chatId);
     if (!draft) return;
 
-    if (draft.step === "COUNTRY") {
-      const matches = catalogService.searchCountries(text);
-      if (matches.length === 0) {
-        await this.send(chatId, "No country matched. Try another spelling:");
-        return;
-      }
-      const rows: TelegramInlineButton[][] = matches.map((c) => [
-        { text: `${c.name} (${c.code})`, callback_data: `nat:${c.code}` },
-      ]);
-      await this.send(chatId, "Tap your country below:", rows);
-      return;
-    }
-
     if (draft.step === "NIE") {
       draft.nie = text.toUpperCase();
       draft.step = "FULL_NAME";
       await this.send(
         chatId,
-        "<b>Step 5/5 — Enter Full Name</b> (exactly as on NIE/Passport):",
+        "<b>Step 4/4 — Enter Full Name</b> (exactly as on NIE/Passport):",
       );
       return;
     }
@@ -394,7 +323,6 @@ class TelegramBotService {
           "",
           `<b>Province:</b> ${escapeHtml(draft.provinceName)}`,
           `<b>Procedure:</b> ${escapeHtml(draft.procedureName)}`,
-          `<b>Nationality:</b> ${escapeHtml(draft.nationalityName)}`,
           `<b>NIE:</b> <code>${escapeHtml(draft.nie)}</code>`,
           `<b>Name:</b> ${escapeHtml(draft.fullName)}`,
         ].join("\n"),
