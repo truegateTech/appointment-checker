@@ -2,9 +2,9 @@ import type { Page } from "playwright";
 import { config } from "@/config/env";
 import { browserService } from "@/services/browser.service";
 import { logger } from "@/services/logger.service";
+import type { Applicant } from "@/types/applicant.types";
 import type { SlotCheckResult } from "@/types/monitor.types";
 import { humanClick, humanPause, humanType } from "@/utils/human";
-import { Applicant } from "@/types/applicant.types";
 
 const NO_SLOTS_MESSAGES = [
   "En este momento no hay citas disponibles.\n\nEn breve, la Oficina pondrá a su disposición nuevas citas.",
@@ -52,22 +52,23 @@ function rejectedResult(page: Page, step: string): SlotCheckResult {
 export async function checkNieSlots(
   applicant: Applicant,
 ): Promise<SlotCheckResult> {
-  return browserService.withPage<SlotCheckResult>(async (page) => {
-    await page.goto(config.appointmentUrl, { waitUntil: "domcontentloaded" });
+  const targetUrl = applicant.provinceUrl || config.appointmentUrl;
+
+  return browserService.withPage<SlotCheckResult>(targetUrl, async (page) => {
+    if (page.url() === targetUrl) {
+      await page.reload({ waitUntil: "domcontentloaded" });
+    } else {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    }
+
     if (await isRejected(page)) {
       return { result: rejectedResult(page, "initial load") };
     }
     await humanPause(1200, 2600);
 
-    await humanClick(
-      page,
-      page.getByText(
-        "PROVINCIA SELECCIONADA Importante: lee toda la información de esta página,",
-      ),
+    const procedureSelect = page.locator(
+      `select[name="${applicant.procedureGroup}"]`,
     );
-    await humanPause(600, 1400);
-
-    const procedureSelect = page.getByLabel("TRÁMITES POLICÍA NACIONAL");
     await humanClick(page, procedureSelect);
     await humanPause(300, 700);
     await procedureSelect.selectOption(applicant.procedureCode);

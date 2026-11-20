@@ -34,45 +34,53 @@ class BrowserService {
     return browser.contexts()[0] ?? (await browser.newContext());
   }
 
-  private async getOrCreatePage(): Promise<Page> {
+  private async getOrCreatePage(targetUrl: string): Promise<Page> {
     if (this.page && !this.page.isClosed()) {
       return this.page;
     }
 
     const context = await this.getActiveContext();
-    const openPages = context.pages().filter((p) => !p.isClosed());
-
-    let targetOrigin = "";
-    try {
-      targetOrigin = new URL(config.appointmentUrl).origin;
-    } catch {
-      // Ignore invalid URL and fall back to first available tab
+    if (!config.reuseTab) {
+      this.page = await context.newPage();
+      this.page.setDefaultTimeout(30_000);
+      return this.page;
     }
 
-    // Prefer a tab already on the appointment portal, then a blank tab, then the first open tab
-    const reusablePage =
+    const openPages = context.pages().filter((p) => !p.isClosed());
+    let targetOrigin = "";
+    try {
+      targetOrigin = new URL(targetUrl).origin;
+    } catch {
+      // Fallback to first open tab
+    }
+
+    const reusable =
       (targetOrigin
         ? openPages.find((p) => p.url().startsWith(targetOrigin))
         : undefined) ??
       openPages.find((p) => p.url() === "about:blank") ??
       openPages[0];
 
-    this.page = reusablePage ?? (await context.newPage());
+    this.page = reusable ?? (await context.newPage());
     this.page.setDefaultTimeout(30_000);
     return this.page;
   }
 
   async withPage<T>(
+    targetUrl: string,
     taskFn: (page: Page) => Promise<{ result: T; keepTabOpen?: boolean }>,
   ): Promise<T> {
-    const page = await this.getOrCreatePage();
+    const page = await this.getOrCreatePage(targetUrl);
 
     try {
       const outcome = await taskFn(page);
 
-      // If a slot is found and KEEP_TAB_ON_SLOT=true, release our reference to this tab
-      // so the next poll cycle does not reload over your active booking screen
       if (outcome.keepTabOpen) {
+        // Leave this tab open for manual booking and detach it from future polls
+        await page.bringToFront().catch(() => {});
+        this.page = null;
+      } else if (!config.reuseTab) {
+        await page.close().catch(() => {});
         this.page = null;
       }
 
@@ -87,6 +95,10 @@ class BrowserService {
           .screenshot({ path: screenshotPath, fullPage: true })
           .catch(() => {});
         error.screenshotPath = screenshotPath;
+        if (!config.reuseTab) {
+          await page.close().catch(() => {});
+          this.page = null;
+        }
       } else {
         this.page = null;
       }

@@ -7,6 +7,7 @@
     "start": "tsx src/index.ts",
     "build": "tsup src/index.ts --format esm --platform node --target node20 --clean",
     "start:prod": "node dist/index.js",
+    "sync:catalog": "npx tsx src/scripts/sync-catalog.ts --provinces=Barcelona,Madrid,Valencia",
     "typecheck": "tsc --noEmit",
     "test": "playwright test",
     "test:headed": "playwright test --headed",

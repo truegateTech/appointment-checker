@@ -67,10 +67,12 @@ export class SlotPoller {
     }
 
     const applicant = applicants[this.cursor % applicants.length];
+    if (!applicant) return;
     this.cursor = (this.cursor + 1) % applicants.length;
 
     const startedAt = Date.now();
     let lastStatus: CheckStatus = "NO_SLOTS";
+    const applicantLabel = `${applicant.fullName} (${applicant.nie}) — ${applicant.provinceName}`;
 
     try {
       const result = await checkNieSlots(applicant);
@@ -82,7 +84,7 @@ export class SlotPoller {
       const entry = logger.recordCheck(
         {
           ...result,
-          details: `Applicant: ${applicant.fullName} (${applicant.nie})${
+          details: `Applicant: ${applicantLabel}${
             result.details ? ` | ${result.details}` : ""
           }`,
         },
@@ -91,24 +93,42 @@ export class SlotPoller {
       const stats = logger.getStats();
 
       if (result.status === "AVAILABLE") {
+        dbService.setActiveById(applicant.id, false);
+
+        const recipientChatId = applicant.chatId ?? config.telegramChatId;
         await telegram.sendSlotAlert({
           checkNumber: entry.checkNumber,
           message: result.message,
           url: result.url,
+          chatId: recipientChatId,
           details: entry.details,
           screenshotPath: result.screenshotPath,
         });
+
+        // Also notify the admin if this alert belonged to another user
+        if (recipientChatId !== config.telegramChatId) {
+          await telegram
+            .sendSlotAlert({
+              checkNumber: entry.checkNumber,
+              message: `[Admin Copy] ${result.message}`,
+              url: result.url,
+              chatId: config.telegramChatId,
+              details: entry.details,
+              screenshotPath: result.screenshotPath,
+            })
+            .catch(() => {});
+        }
       } else if (config.isDev) {
         await telegram
           .sendCheckStatusUpdate({
             checkNumber: entry.checkNumber,
             status: result.status,
-            applicantLabel: `${applicant.fullName} (${applicant.nie})`,
+            applicantLabel,
             durationMs,
             message: result.message,
             url: result.url,
           })
-          .catch((tgErr) =>
+          .catch((tgErr: unknown) =>
             console.error("Failed to send dev status notification:", tgErr),
           );
       } else if (
@@ -121,11 +141,11 @@ export class SlotPoller {
             reason: result.message,
             stats,
           })
-          .catch((tgErr) =>
+          .catch((tgErr: unknown) =>
             console.error("Failed to send Telegram rejection alert:", tgErr),
           );
       }
-    } catch (err) {
+    } catch (err: unknown) {
       lastStatus = "ERROR";
       dbService.recordApplicantCheck(applicant.id, "ERROR");
 
@@ -135,11 +155,10 @@ export class SlotPoller {
       const report = logger.recordError(error, Date.now() - startedAt);
       const stats = logger.getStats();
 
-      const shouldAlertError =
+      if (
         config.isDev ||
-        stats.consecutiveFailures === config.errorAlertThreshold;
-
-      if (shouldAlertError) {
+        stats.consecutiveFailures === config.errorAlertThreshold
+      ) {
         await telegram
           .sendFailureAlert({
             title: "NIE Slot Monitor Error Report",
@@ -147,7 +166,7 @@ export class SlotPoller {
             stats,
             errorReport: report,
           })
-          .catch((tgErr) =>
+          .catch((tgErr: unknown) =>
             console.error("Failed to send Telegram error alert:", tgErr),
           );
       }
@@ -156,11 +175,5 @@ export class SlotPoller {
     const { consecutiveFailures } = logger.getStats();
     const delayMs = this.computeNextDelayMs(lastStatus, consecutiveFailures);
     this.scheduleNext(delayMs);
-
-    if (!this.running) return;
-
-    this.timer = setTimeout(() => {
-      void this.runCycle();
-    }, delayMs);
   }
 }

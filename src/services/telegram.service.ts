@@ -1,21 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "@/config/env";
+import type { MonitorStats, NonErrorCheckStatus } from "@/types/monitor.types";
 import type {
-  CheckStatus,
-  ErrorReport,
-  MonitorStats,
-} from "@/types/monitor.types";
+  CheckStatusUpdateParams,
+  FailureAlertParams,
+  SendMessageOptions,
+  SlotAlertParams,
+  TelegramApiResponse,
+  TelegramReplyMarkup,
+  TelegramUpdate,
+} from "@/types/telegram.types";
 
-interface TelegramApiResponse {
-  ok: boolean;
-  result?: { message_id: number };
-  error_code?: number;
-  description?: string;
-  parameters?: { retry_after?: number };
-}
-
-function escapeHtml(text = ""): string {
+export function escapeHtml(text = ""): string {
   return String(text)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -26,7 +23,7 @@ function withEnvPrefix(htmlText: string): string {
   return config.isDev ? `<code>[DEV]</code> ${htmlText}` : htmlText;
 }
 
-const STATUS_BADGE: Record<Exclude<CheckStatus, "ERROR">, string> = {
+const STATUS_BADGE: Record<NonErrorCheckStatus, string> = {
   AVAILABLE: "🚨 AVAILABLE",
   NO_SLOTS: "ℹ️ NO SLOTS",
   SESSION_EXPIRED: "⏳ SESSION EXPIRED",
@@ -35,48 +32,91 @@ const STATUS_BADGE: Record<Exclude<CheckStatus, "ERROR">, string> = {
 
 class TelegramService {
   private readonly apiBase = `https://api.telegram.org/bot${config.telegramBotToken}`;
-  private lastSlotAlertAt = 0;
-  private lastAlertSignature = "";
+  private readonly lastAlerts = new Map<string, number>();
 
-  async sendMessage(
-    htmlText: string,
-    extra: Record<string, unknown> = {},
-  ): Promise<number | undefined> {
-    const response = await fetch(`${this.apiBase}/sendMessage`, {
+  async callApi<T>(
+    method: string,
+    body: Record<string, unknown>,
+    timeoutMs = 15_000,
+  ): Promise<T> {
+    const response = await fetch(`${this.apiBase}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: config.telegramChatId,
-        text: withEnvPrefix(htmlText).slice(0, 4000),
-        parse_mode: "HTML",
-        ...extra,
-      }),
-      signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
-    const data = (await response.json()) as TelegramApiResponse;
-    if (!response.ok || !data.ok) {
+    const data = (await response.json()) as TelegramApiResponse<T>;
+    if (!response.ok || !data.ok || data.result === undefined) {
       const retry = data.parameters?.retry_after
         ? ` (retry_after: ${data.parameters.retry_after}s)`
         : "";
       throw new Error(
-        `Telegram API error ${data.error_code ?? response.status}: ${data.description ?? "Unknown"}${retry}`,
+        `Telegram ${method} error ${data.error_code ?? response.status}: ${data.description ?? "Unknown"}${retry}`,
       );
     }
 
-    return data.result?.message_id;
+    return data.result;
+  }
+
+  async getUpdates(
+    offset: number,
+    signal?: AbortSignal,
+  ): Promise<TelegramUpdate[]> {
+    const response = await fetch(
+      `${this.apiBase}/getUpdates?timeout=30&offset=${offset}`,
+      { signal },
+    );
+    const data = (await response.json()) as TelegramApiResponse<
+      TelegramUpdate[]
+    >;
+
+    if (!response.ok || !data.ok) {
+      throw new Error(
+        `Telegram getUpdates error ${data.error_code ?? response.status}: ${data.description ?? "Unknown"}`,
+      );
+    }
+
+    return data.result ?? [];
+  }
+
+  async answerCallbackQuery(callbackQueryId: string): Promise<void> {
+    await this.callApi<boolean>("answerCallbackQuery", {
+      callback_query_id: callbackQueryId,
+    }).catch(() => {});
+  }
+
+  async sendMessage(
+    htmlText: string,
+    options: SendMessageOptions = {},
+  ): Promise<number> {
+    const { chatId, skipDevPrefix = false, ...extra } = options;
+    const text = (skipDevPrefix ? htmlText : withEnvPrefix(htmlText)).slice(
+      0,
+      4000,
+    );
+
+    const result = await this.callApi<{ message_id: number }>("sendMessage", {
+      chat_id: chatId ?? config.telegramChatId,
+      text,
+      parse_mode: "HTML",
+      ...extra,
+    });
+
+    return result.message_id;
   }
 
   private async sendPhoto(
     filePath: string,
     captionHtml: string,
-    replyMarkup?: Record<string, unknown>,
+    chatId?: string,
+    replyMarkup?: TelegramReplyMarkup,
   ): Promise<void> {
     const form = new FormData();
     const fileBytes = fs.readFileSync(filePath);
-    const blob = new Blob([fileBytes], { type: "image/png" });
+    const blob = new Blob([new Uint8Array(fileBytes)], { type: "image/png" });
 
-    form.append("chat_id", config.telegramChatId);
+    form.append("chat_id", chatId ?? config.telegramChatId);
     form.append("photo", blob, path.basename(filePath));
     form.append("caption", withEnvPrefix(captionHtml).slice(0, 1000));
     form.append("parse_mode", "HTML");
@@ -98,19 +138,13 @@ class TelegramService {
     }
   }
 
-  async sendSlotAlert(params: {
-    checkNumber: number;
-    message: string;
-    url: string;
-    details?: string;
-    screenshotPath?: string;
-  }): Promise<{ skipped: boolean }> {
+  async sendSlotAlert(params: SlotAlertParams): Promise<{ skipped: boolean }> {
     const now = Date.now();
-    const signature = `${params.message}|${params.url}`;
-    const inCooldown = now - this.lastSlotAlertAt < config.alertCooldownMs;
+    const targetChatId = params.chatId ?? config.telegramChatId;
+    const cooldownKey = `${targetChatId}:${params.message}|${params.url}`;
+    const lastSentAt = this.lastAlerts.get(cooldownKey) ?? 0;
 
-    // Bypass cooldown in dev so every test hit delivers immediately
-    if (!config.isDev && inCooldown && signature === this.lastAlertSignature) {
+    if (!config.isDev && now - lastSentAt < config.alertCooldownMs) {
       return { skipped: true };
     }
 
@@ -126,39 +160,42 @@ class TelegramService {
       `<b>Check #:</b> ${params.checkNumber}`,
       `<b>Spain Time:</b> ${escapeHtml(timeMadrid)}`,
       config.keepTabOnSlot
-        ? "<i>The browser tab has been kept open in Chrome.</i>"
+        ? "<i>The browser tab has been kept open in Chrome for booking.</i>"
         : null,
       "",
       `<a href="${escapeHtml(params.url)}">Open Appointment Portal</a>`,
     ]
-      .filter(Boolean)
+      .filter((line): line is string => line !== null)
       .join("\n");
 
-    const replyMarkup = {
+    const replyMarkup: TelegramReplyMarkup = {
       inline_keyboard: [[{ text: "🔗 Open Booking Page", url: params.url }]],
     };
 
     if (params.screenshotPath && fs.existsSync(params.screenshotPath)) {
-      await this.sendPhoto(params.screenshotPath, caption, replyMarkup).catch(
-        () => this.sendMessage(caption, { reply_markup: replyMarkup }),
+      await this.sendPhoto(
+        params.screenshotPath,
+        caption,
+        targetChatId,
+        replyMarkup,
+      ).catch(() =>
+        this.sendMessage(caption, {
+          chatId: targetChatId,
+          reply_markup: replyMarkup,
+        }),
       );
     } else {
-      await this.sendMessage(caption, { reply_markup: replyMarkup });
+      await this.sendMessage(caption, {
+        chatId: targetChatId,
+        reply_markup: replyMarkup,
+      });
     }
 
-    this.lastSlotAlertAt = now;
-    this.lastAlertSignature = signature;
+    this.lastAlerts.set(cooldownKey, now);
     return { skipped: false };
   }
 
-  async sendCheckStatusUpdate(params: {
-    checkNumber: number;
-    status: Exclude<CheckStatus, "ERROR">;
-    applicantLabel: string;
-    durationMs: number;
-    message: string;
-    url: string;
-  }): Promise<void> {
+  async sendCheckStatusUpdate(params: CheckStatusUpdateParams): Promise<void> {
     const text = [
       `<b>${STATUS_BADGE[params.status]}</b> (Check #${params.checkNumber})`,
       `<b>Applicant:</b> ${escapeHtml(params.applicantLabel)}`,
@@ -168,17 +205,13 @@ class TelegramService {
     ].join("\n");
 
     await this.sendMessage(text, {
+      chatId: params.chatId,
       disable_notification: params.status === "NO_SLOTS",
       disable_web_page_preview: true,
     });
   }
 
-  async sendFailureAlert(params: {
-    title: string;
-    reason: string;
-    stats: MonitorStats;
-    errorReport?: ErrorReport;
-  }): Promise<void> {
+  async sendFailureAlert(params: FailureAlertParams): Promise<void> {
     const text = [
       `<b>⚠️ ${escapeHtml(params.title)}</b>`,
       "",
@@ -189,24 +222,23 @@ class TelegramService {
         ? `<b>Screenshot:</b> <code>${escapeHtml(params.errorReport.screenshotPath)}</code>`
         : null,
     ]
-      .filter(Boolean)
+      .filter((line): line is string => line !== null)
       .join("\n");
 
     const screenshotPath = params.errorReport?.screenshotPath;
     if (config.isDev && screenshotPath && fs.existsSync(screenshotPath)) {
-      await this.sendPhoto(screenshotPath, text).catch(() =>
-        this.sendMessage(text),
+      await this.sendPhoto(screenshotPath, text, params.chatId).catch(() =>
+        this.sendMessage(text, { chatId: params.chatId }),
       );
       return;
     }
 
-    await this.sendMessage(text);
+    await this.sendMessage(text, { chatId: params.chatId });
   }
 
   async sendStartupNotice(stats: MonitorStats): Promise<void> {
     const text = [
       `<b>✅ NIE Slot Monitor Started (${escapeHtml(config.nodeEnv)})</b>`,
-      `<b>Portal:</b> ${escapeHtml(config.appointmentUrl)}`,
       `<b>Poll window:</b> ${config.pollMinMs / 1000}s – ${config.pollMaxMs / 1000}s`,
       `<b>Verbose Telegram alerts:</b> ${config.isDev ? "ON (all checks)" : "OFF (slots & error threshold only)"}`,
       `<b>Logged checks so far:</b> ${stats.totalChecks}`,

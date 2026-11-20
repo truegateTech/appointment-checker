@@ -4,8 +4,14 @@ export interface Applicant {
   id: number;
   fullName: string;
   nie: string;
-  nationalityCode: string;
+  provinceCode: string;
+  provinceName: string;
+  provinceUrl: string;
   procedureCode: string;
+  procedureName: string;
+  procedureGroup: string;
+  nationalityCode: string;
+  nationalityName: string;
   chatId: string | null;
   isActive: boolean;
   lastStatus: CheckStatus | null;
@@ -16,7 +22,13 @@ export interface Applicant {
 export interface CreateApplicantInput {
   fullName: string;
   nie: string;
+  provinceCode: string;
+  provinceName: string;
+  provinceUrl: string;
+  procedureCode: string;
+  procedureName: string;
+  procedureGroup: string;
   nationalityCode: string;
-  procedureCode?: string;
+  nationalityName: string;
   chatId?: string;
 }

@@ -5,8 +5,10 @@ export type CheckStatus =
   | "REJECTED"
   | "ERROR";
 
+export type NonErrorCheckStatus = Exclude<CheckStatus, "ERROR">;
+
 export interface SlotCheckResult {
-  status: Exclude<CheckStatus, "ERROR">;
+  status: NonErrorCheckStatus;
   message: string;
   url: string;
   details?: string;
@@ -16,7 +18,7 @@ export interface SlotCheckResult {
 export interface CheckLogEntry {
   timestamp: string;
   checkNumber: number;
-  status: Exclude<CheckStatus, "ERROR">;
+  status: NonErrorCheckStatus;
   durationMs: number;
   message: string;
   url: string;

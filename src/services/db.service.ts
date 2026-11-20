@@ -10,8 +10,14 @@ interface ApplicantRow {
   id: number;
   full_name: string;
   nie: string;
-  nationality_code: string;
+  province_code: string;
+  province_name: string;
+  province_url: string;
   procedure_code: string;
+  procedure_name: string;
+  procedure_group: string;
+  nationality_code: string;
+  nationality_name: string;
   chat_id: string | null;
   is_active: number;
   last_status: CheckStatus | null;
@@ -24,8 +30,14 @@ function mapRow(row: ApplicantRow): Applicant {
     id: row.id,
     fullName: row.full_name,
     nie: row.nie,
-    nationalityCode: row.nationality_code,
+    provinceCode: row.province_code,
+    provinceName: row.province_name,
+    provinceUrl: row.province_url,
     procedureCode: row.procedure_code,
+    procedureName: row.procedure_name,
+    procedureGroup: row.procedure_group,
+    nationalityCode: row.nationality_code,
+    nationalityName: row.nationality_name,
     chatId: row.chat_id,
     isActive: row.is_active === 1,
     lastStatus: row.last_status,
@@ -40,7 +52,6 @@ class DbService {
   constructor() {
     fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
     this.db = new Database(DB_PATH);
-    // WAL mode keeps reads/writes fast and safe when Telegram commands + poller run together
     this.db.pragma("journal_mode = WAL");
     this.initSchema();
   }
@@ -50,9 +61,15 @@ class DbService {
       CREATE TABLE IF NOT EXISTS applicants (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         full_name TEXT NOT NULL,
-        nie TEXT NOT NULL UNIQUE,
-        nationality_code TEXT NOT NULL,
+        nie TEXT NOT NULL,
+        province_code TEXT NOT NULL DEFAULT '8',
+        province_name TEXT NOT NULL DEFAULT 'Barcelona',
+        province_url TEXT NOT NULL DEFAULT 'https://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8&locale=es',
         procedure_code TEXT NOT NULL DEFAULT '4010',
+        procedure_name TEXT NOT NULL DEFAULT 'POLICIA-TOMA DE HUELLAS',
+        procedure_group TEXT NOT NULL DEFAULT 'tramiteGrupo[1]',
+        nationality_code TEXT NOT NULL,
+        nationality_name TEXT NOT NULL DEFAULT '',
         chat_id TEXT,
         is_active INTEGER NOT NULL DEFAULT 1,
         last_status TEXT,
@@ -60,26 +77,58 @@ class DbService {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
+
+    // Add new columns safely if upgrading an older database
+    const cols = this.db.prepare("PRAGMA table_info(applicants)").all() as {
+      name: string;
+    }[];
+    const names = new Set(cols.map((c) => c.name));
+
+    const migrations: [string, string][] = [
+      ["province_code", "TEXT NOT NULL DEFAULT '8'"],
+      ["province_name", "TEXT NOT NULL DEFAULT 'Barcelona'"],
+      [
+        "province_url",
+        "TEXT NOT NULL DEFAULT 'https://icp.administracionelectronica.gob.es/icpplustieb/citar?p=8&locale=es'",
+      ],
+      ["procedure_name", "TEXT NOT NULL DEFAULT 'POLICIA-TOMA DE HUELLAS'"],
+      ["procedure_group", "TEXT NOT NULL DEFAULT 'tramiteGrupo[1]'"],
+      ["nationality_name", "TEXT NOT NULL DEFAULT ''"],
+    ];
+
+    for (const [col, def] of migrations) {
+      if (!names.has(col)) {
+        this.db.exec(`ALTER TABLE applicants ADD COLUMN ${col} ${def}`);
+      }
+    }
   }
 
-  upsertApplicant(input: CreateApplicantInput): Applicant {
+  createApplicant(input: CreateApplicantInput): Applicant {
     const stmt = this.db.prepare(`
-      INSERT INTO applicants (full_name, nie, nationality_code, procedure_code, chat_id, is_active)
-      VALUES (@fullName, @nie, @nationalityCode, @procedureCode, @chatId, 1)
-      ON CONFLICT(nie) DO UPDATE SET
-        full_name = excluded.full_name,
-        nationality_code = excluded.nationality_code,
-        procedure_code = excluded.procedure_code,
-        chat_id = COALESCE(excluded.chat_id, applicants.chat_id),
-        is_active = 1
+      INSERT INTO applicants (
+        full_name, nie, province_code, province_name, province_url,
+        procedure_code, procedure_name, procedure_group,
+        nationality_code, nationality_name, chat_id, is_active
+      )
+      VALUES (
+        @fullName, @nie, @provinceCode, @provinceName, @provinceUrl,
+        @procedureCode, @procedureName, @procedureGroup,
+        @nationalityCode, @nationalityName, @chatId, 1
+      )
       RETURNING *
     `);
 
     const row = stmt.get({
-      fullName: input.fullName.trim(),
+      fullName: input.fullName.trim().toUpperCase(),
       nie: input.nie.trim().toUpperCase(),
-      nationalityCode: input.nationalityCode.trim(),
-      procedureCode: input.procedureCode?.trim() || "4010",
+      provinceCode: input.provinceCode,
+      provinceName: input.provinceName,
+      provinceUrl: input.provinceUrl,
+      procedureCode: input.procedureCode,
+      procedureName: input.procedureName,
+      procedureGroup: input.procedureGroup,
+      nationalityCode: input.nationalityCode,
+      nationalityName: input.nationalityName,
       chatId: input.chatId?.trim() || null,
     }) as ApplicantRow;
 
@@ -93,24 +142,48 @@ class DbService {
     return rows.map(mapRow);
   }
 
-  findByNameOrNie(query: string): Applicant | null {
-    const q = query.trim();
-    const row = this.db
-      .prepare(
-        `SELECT * FROM applicants
-         WHERE UPPER(nie) = UPPER(?) OR LOWER(full_name) LIKE LOWER(?)
-         LIMIT 1`,
-      )
-      .get(q, `%${q}%`) as ApplicantRow | undefined;
+  getByChatId(chatId: string): Applicant[] {
+    const rows = this.db
+      .prepare("SELECT * FROM applicants WHERE chat_id = ? ORDER BY id DESC")
+      .all(chatId) as ApplicantRow[];
+    return rows.map(mapRow);
+  }
+
+  toggleById(id: number, chatId: string, isAdmin = false): Applicant | null {
+    const row = isAdmin
+      ? (this.db
+          .prepare(
+            `UPDATE applicants
+             SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END
+             WHERE id = ?
+             RETURNING *`,
+          )
+          .get(id) as ApplicantRow | undefined)
+      : (this.db
+          .prepare(
+            `UPDATE applicants
+             SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END
+             WHERE id = ? AND chat_id = ?
+             RETURNING *`,
+          )
+          .get(id, chatId) as ApplicantRow | undefined);
+
     return row ? mapRow(row) : null;
   }
 
-  setActive(nie: string, active: boolean): boolean {
-    const res = this.db
-      .prepare(
-        "UPDATE applicants SET is_active = ? WHERE UPPER(nie) = UPPER(?)",
-      )
-      .run(active ? 1 : 0, nie.trim());
+  setActiveById(id: number, active: boolean): void {
+    this.db
+      .prepare("UPDATE applicants SET is_active = ? WHERE id = ?")
+      .run(active ? 1 : 0, id);
+  }
+
+  deleteById(id: number, chatId: string, isAdmin = false): boolean {
+    const res = isAdmin
+      ? this.db.prepare("DELETE FROM applicants WHERE id = ?").run(id)
+      : this.db
+          .prepare("DELETE FROM applicants WHERE id = ? AND chat_id = ?")
+          .run(id, chatId);
+
     return res.changes > 0;
   }
 
