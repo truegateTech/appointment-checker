@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import {
   chromium,
   type Browser,
@@ -7,13 +9,36 @@ import {
 import { config } from "@/config/env";
 import { logger } from "@/services/logger.service";
 import type { SelectedProxy } from "@/services/proxy.service";
-import { ProxyOutcome } from "@/types/monitor.types";
+import type { ProxyOutcome } from "@/types/monitor.types";
 
 export interface PageError extends Error {
   screenshotPath?: string;
 }
 
+type ProxyWithGeo = SelectedProxy & {
+  locale?: string;
+  timezoneId?: string;
+};
+
 const IP_PROBE_URL = "https://ipv4.webshare.io/";
+const PROFILES_ROOT = path.resolve("data/browser-profiles");
+const DEFAULT_LOCALE = "es-ES";
+const DEFAULT_TIMEZONE_ID = "Europe/Madrid";
+
+function getUserDataDir(proxy: SelectedProxy): string {
+  // Residential mode generates a brand-new session ID every check:
+  // passing "" lets Playwright auto-create & clean up a temporary profile dir
+  // so disk usage doesn't grow by ~50 MB per cycle.
+  if (proxy.mode === "residential") {
+    return "";
+  }
+
+  // Static/sticky profile mode: one persistent Chrome profile folder per proxy ID
+  const safeName = proxy.id.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+  const profileDir = path.join(PROFILES_ROOT, safeName);
+  fs.mkdirSync(profileDir, { recursive: true });
+  return profileDir;
+}
 
 async function probeProxyExit(
   context: BrowserContext,
@@ -37,35 +62,28 @@ class BrowserService {
   private isCdpMode = false;
   private pollingPage: Page | null = null;
   private readonly lockedSlotPages = new WeakSet<Page>();
+  private readonly activeContexts = new Set<BrowserContext>();
   private isBusy = false;
 
-  async connect(): Promise<Browser> {
-    if (this.browser?.isConnected()) {
+  async connect(): Promise<Browser | null> {
+    if (config.proxyMode === "none") {
+      this.isCdpMode = true;
+      if (this.browser?.isConnected()) {
+        return this.browser;
+      }
+
+      this.browser = await chromium.connectOverCDP(config.cdpUrl);
+      this.browser.on("disconnected", () => {
+        this.browser = null;
+        this.pollingPage = null;
+      });
       return this.browser;
     }
 
-    if (config.proxyMode === "none") {
-      this.isCdpMode = true;
-      this.browser = await chromium.connectOverCDP(config.cdpUrl);
-    } else {
-      this.isCdpMode = false;
-      this.browser = await chromium.launch({
-        headless: config.headless,
-        channel: config.browserChannel,
-        proxy: { server: "http://per-context" },
-        // args: [
-        //   "--start-maximized",
-        //   "--disable-blink-features=AutomationControlled",
-        // ],
-      });
-    }
-
-    this.browser.on("disconnected", () => {
-      this.browser = null;
-      this.pollingPage = null;
-    });
-
-    return this.browser;
+    // In proxy mode, launchPersistentContext() spawns the browser per profile in withPage()
+    this.isCdpMode = false;
+    fs.mkdirSync(PROFILES_ROOT, { recursive: true });
+    return null;
   }
 
   private async getSingleCdpPage(targetUrl: string): Promise<Page> {
@@ -74,6 +92,10 @@ class BrowserService {
     }
 
     const browser = await this.connect();
+    if (!browser) {
+      throw new Error("CDP browser is not connected.");
+    }
+
     const context = browser.contexts()[0] ?? (await browser.newContext());
     const availablePages = context
       .pages()
@@ -107,7 +129,7 @@ class BrowserService {
   async withPage<T>(
     targetUrl: string,
     taskFn: (page: Page) => Promise<{ result: T; keepTabOpen?: boolean }>,
-    proxy?: SelectedProxy | null,
+    proxy?: ProxyWithGeo | null,
   ): Promise<T> {
     if (this.isBusy) {
       throw new Error("BrowserService is already running a slot check.");
@@ -122,27 +144,35 @@ class BrowserService {
     let probeLatencyMs: number | null = null;
     let portalTtfbMs: number | null = null;
     let portalHttpStatus: number | null = null;
-    let outcome: "SUCCESS" | "REJECTED" | "ERROR" = "SUCCESS";
+    let outcome: ProxyOutcome = "SUCCESS";
     let errorMessage: string | undefined;
 
     try {
-      let outcome: ProxyOutcome = "SUCCESS";
-      const browser = await this.connect();
-
-      if (this.isCdpMode) {
+      if (config.proxyMode === "none") {
+        this.isCdpMode = true;
         page = await this.getSingleCdpPage(targetUrl);
       } else {
+        this.isCdpMode = false;
         if (!proxy) {
           throw new Error("Proxy mode is enabled but no proxy was provided.");
         }
 
-        const context = await browser.newContext({
+        const userDataDir = getUserDataDir(proxy);
+        const context = await chromium.launchPersistentContext(userDataDir, {
+          headless: config.headless,
+          channel: config.browserChannel,
+          viewport: config.headless ? { width: 1920, height: 1080 } : null, // TS equivalent of no_viewport=True
+          args: ["--start-maximized"],
           proxy: proxy.playwrightProxy,
-          // locale: "es-ES",
-          // timezoneId: "Europe/Madrid",
-          viewport: null,
+          timezoneId: proxy.timezoneId ?? DEFAULT_TIMEZONE_ID,
+          locale: proxy.locale ?? DEFAULT_LOCALE,
         });
+
         contextToClose = context;
+        this.activeContexts.add(context);
+        context.on("close", () => {
+          this.activeContexts.delete(context);
+        });
 
         if (config.blockHeavyAssets) {
           await context.route("**/*", (route) => {
@@ -160,7 +190,8 @@ class BrowserService {
           probeLatencyMs = probe.probeLatencyMs;
         }
 
-        page = await context.newPage();
+        // Reuse the default blank tab created by launchPersistentContext
+        page = context.pages()[0] ?? (await context.newPage());
         page.setDefaultTimeout(35_000);
       }
 
@@ -196,6 +227,7 @@ class BrowserService {
         if (this.isCdpMode) {
           this.pollingPage = null;
         } else {
+          // Keep this persistent profile window open so you can finish booking
           contextToClose = null;
         }
       } else if (this.isCdpMode && !config.reuseTab) {
@@ -251,6 +283,12 @@ class BrowserService {
 
   async disconnect(): Promise<void> {
     this.pollingPage = null;
+
+    for (const ctx of Array.from(this.activeContexts)) {
+      await ctx.close().catch(() => {});
+    }
+    this.activeContexts.clear();
+
     if (this.browser) {
       await this.browser.close().catch(() => {});
       this.browser = null;
