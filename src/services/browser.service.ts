@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import {
   chromium,
   type Browser,
@@ -29,26 +31,26 @@ export class ProxyPreflightError extends Error {
   }
 }
 
-export interface ProxyGeoMetadata {
+type ProxyWithGeo = SelectedProxy & {
   locale?: string;
   timezoneId?: string;
-  geolocation?: {
-    latitude: number;
-    longitude: number;
-    accuracy?: number;
-  };
-}
-
-type ProxyWithGeo = SelectedProxy & ProxyGeoMetadata;
+};
 
 const IP_PROBE_URL = "https://ipv4.webshare.io/";
+const PROFILES_ROOT = path.resolve("data/browser-profiles");
 const DEFAULT_LOCALE = "es-ES";
 const DEFAULT_TIMEZONE_ID = "Europe/Madrid";
-const DEFAULT_GEOLOCATION = {
-  latitude: 40.4168,
-  longitude: -3.7038,
-  accuracy: 50,
-};
+
+function getUserDataDir(proxy: SelectedProxy): string {
+  if (proxy.mode === "residential") {
+    return "";
+  }
+
+  const safeName = proxy.id.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+  const profileDir = path.join(PROFILES_ROOT, safeName);
+  fs.mkdirSync(profileDir, { recursive: true });
+  return profileDir;
+}
 
 async function probeProxyExit(
   context: BrowserContext,
@@ -69,31 +71,42 @@ async function probeProxyExit(
 
 class BrowserService {
   private browser: Browser | null = null;
+  private isCdpMode = false;
   private pollingPage: Page | null = null;
   private readonly lockedSlotPages = new WeakSet<Page>();
   private readonly activeContexts = new Set<BrowserContext>();
   private isBusy = false;
 
-  async connect(): Promise<Browser> {
-    if (this.browser?.isConnected()) {
+  async connect(): Promise<Browser | null> {
+    if (config.proxyMode === "none") {
+      this.isCdpMode = true;
+      if (this.browser?.isConnected()) {
+        return this.browser;
+      }
+
+      this.browser = await chromium.connectOverCDP(config.cdpUrl);
+      this.browser.on("disconnected", () => {
+        this.browser = null;
+        this.pollingPage = null;
+      });
       return this.browser;
     }
 
-    this.browser = await chromium.connectOverCDP(config.cdpUrl);
-    this.browser.on("disconnected", () => {
-      this.browser = null;
-      this.pollingPage = null;
-    });
-
-    return this.browser;
+    this.isCdpMode = false;
+    fs.mkdirSync(PROFILES_ROOT, { recursive: true });
+    return null;
   }
 
-  private async getDefaultCdpPage(targetUrl: string): Promise<Page> {
+  private async getSingleCdpPage(targetUrl: string): Promise<Page> {
     if (this.pollingPage && !this.pollingPage.isClosed()) {
       return this.pollingPage;
     }
 
     const browser = await this.connect();
+    if (!browser) {
+      throw new Error("CDP browser is not connected.");
+    }
+
     const context = browser.contexts()[0] ?? (await browser.newContext());
     const availablePages = context
       .pages()
@@ -135,7 +148,6 @@ class BrowserService {
 
     this.isBusy = true;
     const totalStartedAt = Date.now();
-    const useProxyContext = config.proxyMode !== "none";
     let contextToClose: BrowserContext | null = null;
     let page: Page | null = null;
 
@@ -147,22 +159,27 @@ class BrowserService {
     let errorMessage: string | undefined;
 
     try {
-      const browser = await this.connect();
-
-      if (!useProxyContext) {
-        page = await this.getDefaultCdpPage(targetUrl);
+      if (config.proxyMode === "none") {
+        this.isCdpMode = true;
+        page = await this.getSingleCdpPage(targetUrl);
       } else {
+        this.isCdpMode = false;
         if (!proxy) {
           throw new Error("Proxy mode is enabled but no proxy was provided.");
         }
 
-        const context = await browser.newContext({
-          proxy: proxy.playwrightProxy,
+        const userDataDir = getUserDataDir(proxy);
+        const context = await chromium.launchPersistentContext(userDataDir, {
+          headless: config.headless,
           viewport: null,
-          locale: proxy.locale ?? DEFAULT_LOCALE,
+          channel: config.browserChannel,
+          proxy: proxy.playwrightProxy,
           timezoneId: proxy.timezoneId ?? DEFAULT_TIMEZONE_ID,
-          geolocation: proxy.geolocation ?? DEFAULT_GEOLOCATION,
-          permissions: ["geolocation"],
+          locale: proxy.locale ?? DEFAULT_LOCALE,
+          args: [
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--force-webrtc-ip-handling-policy",
+          ],
         });
 
         contextToClose = context;
@@ -202,7 +219,7 @@ class BrowserService {
           });
         }
 
-        page = await context.newPage();
+        page = context.pages()[0] ?? (await context.newPage());
         page.setDefaultTimeout(35_000);
       }
 
@@ -235,13 +252,12 @@ class BrowserService {
       if (taskOutcome.keepTabOpen) {
         this.lockedSlotPages.add(page);
         await page.bringToFront().catch(() => {});
-        if (!useProxyContext) {
+        if (this.isCdpMode) {
           this.pollingPage = null;
         } else {
-          // Keep the CDP context open so you can complete the booking manually
           contextToClose = null;
         }
-      } else if (!useProxyContext && !config.reuseTab) {
+      } else if (this.isCdpMode && !config.reuseTab) {
         await page.close().catch(() => {});
         this.pollingPage = null;
       }
@@ -267,7 +283,7 @@ class BrowserService {
           .catch(() => {});
         error.screenshotPath = screenshotPath;
       }
-      if (!useProxyContext && !config.reuseTab && page && !page.isClosed()) {
+      if (this.isCdpMode && !config.reuseTab && page && !page.isClosed()) {
         await page.close().catch(() => {});
         this.pollingPage = null;
       }
