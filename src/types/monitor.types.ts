@@ -53,3 +53,19 @@ export interface MonitorStats {
   dailyDate: string;
   checksToday: number;
 }
+
+export interface ProxyDevLogEntry {
+  timestamp: string;
+  mode: "none" | "list" | "residential";
+  proxyId: string;
+  server: string;
+  username: string | null;
+  exitIp: string | null;
+  probeLatencyMs: number | null;
+  portalTtfbMs: number | null;
+  portalHttpStatus: number | null;
+  totalDurationMs: number;
+  outcome: "SUCCESS" | "REJECTED" | "ERROR";
+  targetUrl: string;
+  error?: string;
+}

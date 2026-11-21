@@ -12,6 +12,25 @@ export interface PageError extends Error {
   screenshotPath?: string;
 }
 
+const IP_PROBE_URL = "https://ipv4.webshare.io/";
+
+async function probeProxyExit(
+  context: BrowserContext,
+): Promise<{ exitIp: string | null; probeLatencyMs: number | null }> {
+  const startedAt = Date.now();
+  try {
+    const res = await context.request.get(IP_PROBE_URL, { timeout: 10_000 });
+    const probeLatencyMs = Date.now() - startedAt;
+    if (!res.ok()) {
+      return { exitIp: null, probeLatencyMs };
+    }
+    const exitIp = (await res.text()).trim() || null;
+    return { exitIp, probeLatencyMs };
+  } catch {
+    return { exitIp: null, probeLatencyMs: Date.now() - startedAt };
+  }
+}
+
 class BrowserService {
   private browser: Browser | null = null;
   private isCdpMode = false;
@@ -32,7 +51,6 @@ class BrowserService {
       this.browser = await chromium.launch({
         headless: config.headless,
         channel: config.browserChannel,
-        // Enables per-context proxy overrides across Windows, macOS, and Linux
         proxy: { server: "http://per-context" },
         args: ["--disable-blink-features=AutomationControlled"],
       });
@@ -92,8 +110,16 @@ class BrowserService {
     }
 
     this.isBusy = true;
+    const totalStartedAt = Date.now();
     let contextToClose: BrowserContext | null = null;
     let page: Page | null = null;
+
+    let exitIp: string | null = null;
+    let probeLatencyMs: number | null = null;
+    let portalTtfbMs: number | null = null;
+    let portalHttpStatus: number | null = null;
+    let outcome: "SUCCESS" | "REJECTED" | "ERROR" = "SUCCESS";
+    let errorMessage: string | undefined;
 
     try {
       const browser = await this.connect();
@@ -113,14 +139,12 @@ class BrowserService {
         });
         contextToClose = context;
 
-        // Mask navigator.webdriver just like your original test script
         await context.addInitScript(() => {
           Object.defineProperty(navigator, "webdriver", {
             get: () => undefined,
           });
         });
 
-        // Save proxy bandwidth by dropping non-essential heavy assets
         if (config.blockHeavyAssets) {
           await context.route("**/*", (route) => {
             const type = route.request().resourceType();
@@ -131,19 +155,48 @@ class BrowserService {
           });
         }
 
+        // Dev-only lightweight probe: confirms exit IP and proxy round-trip latency
+        if (config.isDev) {
+          const probe = await probeProxyExit(context);
+          exitIp = probe.exitIp;
+          probeLatencyMs = probe.probeLatencyMs;
+        }
+
         page = await context.newPage();
         page.setDefaultTimeout(35_000);
       }
 
-      const outcome = await taskFn(page);
+      // Dev-only listener: measure first main-document response from target portal
+      if (config.isDev && page) {
+        const navStartedAt = Date.now();
+        let captured = false;
+        page.on("response", (res) => {
+          if (captured) return;
+          if (
+            res.request().isNavigationRequest() &&
+            res.frame() === page?.mainFrame()
+          ) {
+            captured = true;
+            portalHttpStatus = res.status();
+            portalTtfbMs = Date.now() - navStartedAt;
+          }
+        });
+      }
 
-      if (outcome.keepTabOpen) {
+      const taskOutcome = await taskFn(page);
+
+      const maybeStatus = (taskOutcome.result as { status?: string } | null)
+        ?.status;
+      if (maybeStatus === "REJECTED") {
+        outcome = "REJECTED";
+      }
+
+      if (taskOutcome.keepTabOpen) {
         this.lockedSlotPages.add(page);
         await page.bringToFront().catch(() => {});
         if (this.isCdpMode) {
           this.pollingPage = null;
         } else {
-          // Keep this context open so you can book immediately on the same proxy IP
           contextToClose = null;
         }
       } else if (this.isCdpMode && !config.reuseTab) {
@@ -151,11 +204,14 @@ class BrowserService {
         this.pollingPage = null;
       }
 
-      return outcome.result;
+      return taskOutcome.result;
     } catch (err) {
+      outcome = "ERROR";
       const error = (
         err instanceof Error ? err : new Error(String(err))
       ) as PageError;
+      errorMessage = error.message;
+
       if (page && !page.isClosed()) {
         const screenshotPath = logger.getScreenshotPath("error");
         await page
@@ -169,6 +225,24 @@ class BrowserService {
       }
       throw error;
     } finally {
+      if (config.isDev) {
+        logger.recordProxyDevLog({
+          timestamp: new Date().toISOString(),
+          mode: config.proxyMode,
+          proxyId: proxy?.id ?? "direct-cdp",
+          server: proxy?.server ?? config.cdpUrl,
+          username: proxy?.username ?? null,
+          exitIp,
+          probeLatencyMs,
+          portalTtfbMs,
+          portalHttpStatus,
+          totalDurationMs: Date.now() - totalStartedAt,
+          outcome,
+          targetUrl,
+          ...(errorMessage ? { error: errorMessage } : {}),
+        });
+      }
+
       if (contextToClose) {
         await contextToClose.close().catch(() => {});
       }

@@ -12,11 +12,16 @@ export interface PlaywrightProxyConfig {
 export interface SelectedProxy {
   id: string;
   label: string;
+  mode: "list" | "residential";
+  server: string;
+  username: string | null;
   playwrightProxy: PlaywrightProxyConfig;
 }
 
 interface StaticProxyState {
   id: string;
+  server: string;
+  username: string | null;
   playwrightProxy: PlaywrightProxyConfig;
   dailyDate: string;
   checksToday: number;
@@ -24,26 +29,40 @@ interface StaticProxyState {
   cooldownUntil: number;
 }
 
-const PROXY_COOLDOWN_MS = 30 * 60 * 1000; // Cool down a rejected/broken IP for 30 mins
+const PROXY_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * Strips any existing Webshare suffix (-es-1, -es-rotate, -1, -rotate, -es-city_madrid-2)
+ * so residential session generation never double-appends parameters.
+ */
+function extractBaseUsername(raw: string): string {
+  return raw
+    .trim()
+    .replace(
+      /-(?:[a-z]{2}(?:-[a-z]{2})*)(?:-(?:city_[a-z_]+))?(?:-(?:\d+|rotate))?$/i,
+      "",
+    )
+    .replace(/-(?:\d+|rotate)$/i, "");
+}
 
 function parseProxyLine(line: string): StaticProxyState | null {
   const cleaned = line.trim();
   if (!cleaned || cleaned.startsWith("#")) return null;
 
-  // Webshare download list format: ip:port:username:password
+  // Webshare download list format: host:port:username:password
   const parts = cleaned.split(":");
   if (parts.length >= 4) {
     const [host, port, username, ...rest] = parts;
     const password = rest.join(":");
     if (!host || !port || !username || !password) return null;
 
+    const server = `http://${host}:${port}`;
     return {
-      id: `${host}:${port}`,
-      playwrightProxy: {
-        server: `http://${host}:${port}`,
-        username,
-        password,
-      },
+      // Include username so backbone entries like p.webshare.io:80:user-es-1 and user-es-2 stay distinct
+      id: `${host}:${port}:${username}`,
+      server,
+      username,
+      playwrightProxy: { server, username, password },
       dailyDate: getMadridDateKey(),
       checksToday: 0,
       rejectedCount: 0,
@@ -51,21 +70,30 @@ function parseProxyLine(line: string): StaticProxyState | null {
     };
   }
 
-  // Fallback for http://user:pass@ip:port URLs
+  // Fallback for http://user:pass@host:port URLs
   try {
     const parsed = new URL(
       cleaned.includes("://") ? cleaned : `http://${cleaned}`,
     );
+    const port = parsed.port || "80";
+    const server = `${parsed.protocol}//${parsed.hostname}:${port}`;
+    const username = parsed.username
+      ? decodeURIComponent(parsed.username)
+      : null;
+    const password = parsed.password
+      ? decodeURIComponent(parsed.password)
+      : undefined;
+
     return {
-      id: `${parsed.hostname}:${parsed.port || "80"}`,
+      id: username
+        ? `${parsed.hostname}:${port}:${username}`
+        : `${parsed.hostname}:${port}`,
+      server,
+      username,
       playwrightProxy: {
-        server: `${parsed.protocol}//${parsed.hostname}:${parsed.port || "80"}`,
-        ...(parsed.username
-          ? { username: decodeURIComponent(parsed.username) }
-          : {}),
-        ...(parsed.password
-          ? { password: decodeURIComponent(parsed.password) }
-          : {}),
+        server,
+        ...(username ? { username } : {}),
+        ...(password ? { password } : {}),
       },
       dailyDate: getMadridDateKey(),
       checksToday: 0,
@@ -80,6 +108,7 @@ function parseProxyLine(line: string): StaticProxyState | null {
 class ProxyService {
   private staticProxies: StaticProxyState[] = [];
   private cursor = 0;
+  private residentialBaseUsername: string | null = null;
   private residentialSessionCounter = Math.floor(1000 + Math.random() * 8000);
 
   isEnabled(): boolean {
@@ -101,13 +130,23 @@ class ProxyService {
           "WEBSHARE_RESIDENTIAL_USERNAME and WEBSHARE_RESIDENTIAL_PASSWORD are required when PROXY_MODE=residential",
         );
       }
+
+      const cleanedBase = extractBaseUsername(
+        config.webshareResidentialUsername,
+      );
+      if (cleanedBase !== config.webshareResidentialUsername.trim()) {
+        console.log(
+          `[Proxy] Normalized WEBSHARE_RESIDENTIAL_USERNAME "${config.webshareResidentialUsername}" -> base "${cleanedBase}" (suffix will be generated per session).`,
+        );
+      }
+      this.residentialBaseUsername = cleanedBase;
+
       console.log(
         `[Proxy] Residential sticky-session mode active (${config.webshareResidentialHost}:${config.webshareResidentialPort}, country=${config.webshareResidentialCountry}).`,
       );
       return;
     }
 
-    // PROXY_MODE=list: fetch from Webshare download URL or fall back to local file
     let rawText = "";
     if (config.webshareProxyListUrl) {
       const response = await fetch(config.webshareProxyListUrl, {
@@ -162,23 +201,30 @@ class ProxyService {
       this.residentialSessionCounter += 1;
       const sessionId = this.residentialSessionCounter;
       const country = config.webshareResidentialCountry;
-      // Sticky session format: {username}-{country}-{sessionId}
+      const baseUser =
+        this.residentialBaseUsername ??
+        extractBaseUsername(config.webshareResidentialUsername ?? "");
+
+      // Webshare sticky session format: {baseUsername}-{country}-{sessionId}
       const username = country
-        ? `${config.webshareResidentialUsername}-${country}-${sessionId}`
-        : `${config.webshareResidentialUsername}-${sessionId}`;
+        ? `${baseUser}-${country}-${sessionId}`
+        : `${baseUser}-${sessionId}`;
+      const server = `http://${config.webshareResidentialHost}:${config.webshareResidentialPort}`;
 
       return {
-        id: `res-${country || "any"}-${sessionId}`,
-        label: `residential:${country || "any"}#${sessionId}`,
+        id: `${config.webshareResidentialHost}:${config.webshareResidentialPort}:${username}`,
+        label: `${server} (${username})`,
+        mode: "residential",
+        server,
+        username,
         playwrightProxy: {
-          server: `http://${config.webshareResidentialHost}:${config.webshareResidentialPort}`,
+          server,
           username,
           password: config.webshareResidentialPassword ?? undefined,
         },
       };
     }
 
-    // PROXY_MODE=list: round-robin across proxies under their 5/day cap and not cooling down
     this.resetStaleDailyCounters();
     const now = Date.now();
     const total = this.staticProxies.length;
@@ -197,13 +243,16 @@ class ProxyService {
         this.cursor = (idx + 1) % total;
         return {
           id: candidate.id,
-          label: `${candidate.id} (${candidate.checksToday + 1}/${config.maxChecksPerProxyPerDay})`,
+          label: `${candidate.server} (${candidate.username ?? "no-auth"} | ${candidate.checksToday + 1}/${config.maxChecksPerProxyPerDay})`,
+          mode: "list",
+          server: candidate.server,
+          username: candidate.username,
           playwrightProxy: candidate.playwrightProxy,
         };
       }
     }
 
-    return null; // All static proxies exhausted for today or currently in cooldown
+    return null;
   }
 
   hasAvailableCapacity(): {
@@ -271,7 +320,6 @@ class ProxyService {
       proxy.checksToday += 1;
       proxy.rejectedCount = 0;
     } else {
-      // WAF rejection, geo-block, or proxy connection timeout -> put this IP in cooldown
       proxy.rejectedCount += 1;
       const multiplier = Math.min(proxy.rejectedCount, 4);
       proxy.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS * multiplier;

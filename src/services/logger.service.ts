@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { config } from "@/config/env";
 import type {
   CheckLogEntry,
   ErrorReport,
   MonitorStats,
+  ProxyDevLogEntry,
   SlotCheckResult,
 } from "@/types/monitor.types";
 import { getMadridDateKey } from "@/utils/schedule";
@@ -12,6 +14,7 @@ const LOG_DIR = path.resolve("logs");
 const SCREENSHOT_DIR = path.join(LOG_DIR, "screenshots");
 const CHECKS_FILE = path.join(LOG_DIR, "checks.jsonl");
 const ERRORS_FILE = path.join(LOG_DIR, "errors.jsonl");
+const PROXY_DEV_LOG_FILE = path.join(LOG_DIR, "proxy-dev.jsonl");
 const STATS_FILE = path.join(LOG_DIR, "stats.json");
 
 class LoggerService {
@@ -88,6 +91,34 @@ class LoggerService {
     return this.stats.checksToday;
   }
 
+  recordProxyDevLog(entry: ProxyDevLogEntry): void {
+    if (!config.isDev) return;
+
+    this.appendJsonLine(PROXY_DEV_LOG_FILE, entry);
+
+    const probe =
+      entry.probeLatencyMs !== null ? `${entry.probeLatencyMs}ms` : "n/a";
+    const ttfb =
+      entry.portalTtfbMs !== null ? `${entry.portalTtfbMs}ms` : "n/a";
+    const http = entry.portalHttpStatus ?? "n/a";
+
+    console.log(
+      [
+        `[Proxy][DEV] mode=${entry.mode}`,
+        `server=${entry.server}`,
+        `user=${entry.username ?? "none"}`,
+        `exitIp=${entry.exitIp ?? "unknown"}`,
+        `probe=${probe}`,
+        `portalTTFB=${ttfb} (HTTP ${http})`,
+        `total=${entry.totalDurationMs}ms`,
+        `outcome=${entry.outcome}`,
+        entry.error ? `err="${entry.error}"` : null,
+      ]
+        .filter((part): part is string => part !== null)
+        .join(" | "),
+    );
+  }
+
   recordCheck(result: SlotCheckResult, durationMs: number): CheckLogEntry {
     this.syncDailyCounter();
 
@@ -119,7 +150,6 @@ class LoggerService {
         break;
     }
 
-    // Count completed form submissions toward the portal's daily limit
     if (result.status !== "REJECTED") {
       this.stats.checksToday += 1;
     }
