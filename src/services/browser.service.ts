@@ -160,12 +160,15 @@ class BrowserService {
         const userDataDir = getUserDataDir(proxy);
         const context = await chromium.launchPersistentContext(userDataDir, {
           headless: config.headless,
+          viewport: null,
           channel: config.browserChannel,
-          viewport: config.headless ? { width: 1920, height: 1080 } : null, // TS equivalent of no_viewport=True
-          args: ["--start-maximized"],
           proxy: proxy.playwrightProxy,
           timezoneId: proxy.timezoneId ?? DEFAULT_TIMEZONE_ID,
           locale: proxy.locale ?? DEFAULT_LOCALE,
+          args: [
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--force-webrtc-ip-handling-policy",
+          ],
         });
 
         contextToClose = context;
