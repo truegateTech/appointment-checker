@@ -8,11 +8,27 @@ import {
 } from "patchright";
 import { config } from "@/config/env";
 import { logger } from "@/services/logger.service";
-import type { SelectedProxy } from "@/services/proxy.service";
+import { proxyService, type SelectedProxy } from "@/services/proxy.service";
 import type { ProxyOutcome } from "@/types/monitor.types";
 
 export interface PageError extends Error {
   screenshotPath?: string;
+}
+
+export class ProxyPreflightError extends Error {
+  readonly exitIp: string | null;
+  readonly proxyUnreachable: boolean;
+
+  constructor(
+    message: string,
+    exitIp: string | null,
+    proxyUnreachable: boolean,
+  ) {
+    super(message);
+    this.name = "ProxyPreflightError";
+    this.exitIp = exitIp;
+    this.proxyUnreachable = proxyUnreachable;
+  }
 }
 
 type ProxyWithGeo = SelectedProxy & {
@@ -26,14 +42,10 @@ const DEFAULT_LOCALE = "es-ES";
 const DEFAULT_TIMEZONE_ID = "Europe/Madrid";
 
 function getUserDataDir(proxy: SelectedProxy): string {
-  // Residential mode generates a brand-new session ID every check:
-  // passing "" lets Playwright auto-create & clean up a temporary profile dir
-  // so disk usage doesn't grow by ~50 MB per cycle.
   if (proxy.mode === "residential") {
     return "";
   }
 
-  // Static/sticky profile mode: one persistent Chrome profile folder per proxy ID
   const safeName = proxy.id.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
   const profileDir = path.join(PROFILES_ROOT, safeName);
   fs.mkdirSync(profileDir, { recursive: true });
@@ -80,7 +92,6 @@ class BrowserService {
       return this.browser;
     }
 
-    // In proxy mode, launchPersistentContext() spawns the browser per profile in withPage()
     this.isCdpMode = false;
     fs.mkdirSync(PROFILES_ROOT, { recursive: true });
     return null;
@@ -177,6 +188,27 @@ class BrowserService {
           this.activeContexts.delete(context);
         });
 
+        // Pre-flight exit IP verification before loading the portal
+        const probe = await probeProxyExit(context);
+        exitIp = probe.exitIp;
+        probeLatencyMs = probe.probeLatencyMs;
+
+        if (!exitIp) {
+          throw new ProxyPreflightError(
+            `Proxy ${proxy.id} failed exit IP probe (${IP_PROBE_URL})`,
+            null,
+            true,
+          );
+        }
+
+        const validation = proxyService.validateExitIp(exitIp, proxy.mode);
+        if (!validation.allowed) {
+          throw new ProxyPreflightError(validation.reason, exitIp, false);
+        }
+
+        proxy.exitIp = exitIp;
+        proxyService.markExitIpSelected(exitIp, proxy.id);
+
         if (config.blockHeavyAssets) {
           await context.route("**/*", (route) => {
             const type = route.request().resourceType();
@@ -187,13 +219,6 @@ class BrowserService {
           });
         }
 
-        if (config.isDev) {
-          const probe = await probeProxyExit(context);
-          exitIp = probe.exitIp;
-          probeLatencyMs = probe.probeLatencyMs;
-        }
-
-        // Reuse the default blank tab created by launchPersistentContext
         page = context.pages()[0] ?? (await context.newPage());
         page.setDefaultTimeout(35_000);
       }
@@ -230,7 +255,6 @@ class BrowserService {
         if (this.isCdpMode) {
           this.pollingPage = null;
         } else {
-          // Keep this persistent profile window open so you can finish booking
           contextToClose = null;
         }
       } else if (this.isCdpMode && !config.reuseTab) {
@@ -241,6 +265,12 @@ class BrowserService {
       return taskOutcome.result;
     } catch (err) {
       outcome = "ERROR";
+
+      if (err instanceof ProxyPreflightError) {
+        errorMessage = err.message;
+        throw err;
+      }
+
       const error = (
         err instanceof Error ? err : new Error(String(err))
       ) as PageError;

@@ -17,6 +17,7 @@ export interface SelectedProxy {
   mode: "list" | "residential";
   server: string;
   username: string | null;
+  exitIp?: string | null;
   playwrightProxy: PlaywrightProxyConfig;
 }
 
@@ -31,8 +32,9 @@ interface StaticProxyState {
   cooldownUntil: number;
   lastUsedAt: number;
 }
+
 const PROXY_COOLDOWN_MS = 30 * 60 * 1000;
-const DAILY_IP_BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
+const DAILY_IP_BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 function extractBaseUsername(raw: string): string {
   return raw
@@ -107,6 +109,7 @@ class ProxyService {
   private staticProxies: StaticProxyState[] = [];
   private cursor = 0;
   private lastUsedProxyId: string | null = null;
+  private lastUsedExitIp: string | null = null;
   private residentialBaseUsername: string | null = null;
   private residentialSessionCounter = Math.floor(1000 + Math.random() * 8000);
   private readonly usedResidentialIds = new Set<string>();
@@ -117,6 +120,7 @@ class ProxyService {
 
   async init(): Promise<void> {
     this.lastUsedProxyId = dbService.getLastUsedProxyId();
+    this.lastUsedExitIp = dbService.getLastUsedExitIp();
 
     if (config.proxyMode === "none") {
       console.log("[Proxy] Disabled (PROXY_MODE=none — using CDP Chrome).");
@@ -144,7 +148,7 @@ class ProxyService {
       this.residentialBaseUsername = cleanedBase;
 
       console.log(
-        `[Proxy] Residential sticky-session mode active (${config.webshareResidentialHost}:${config.webshareResidentialPort}, country=${config.webshareResidentialCountry}).`,
+        `[Proxy] Residential sticky-session mode active (${config.webshareResidentialHost}:${config.webshareResidentialPort}, country=${config.webshareResidentialCountry}, lastExitIp=${this.lastUsedExitIp ?? "none"}).`,
       );
       return;
     }
@@ -195,20 +199,71 @@ class ProxyService {
     }
 
     console.log(
-      `[Proxy] Loaded ${this.staticProxies.length} Webshare proxies (last used: ${this.lastUsedProxyId ?? "none"}).`,
+      `[Proxy] Loaded ${this.staticProxies.length} Webshare proxies (lastUsed=${this.lastUsedProxyId ?? "none"}, lastExitIp=${this.lastUsedExitIp ?? "none"}).`,
     );
   }
 
   private resetStaleDailyCounters(): void {
     const today = getMadridDateKey();
+    const now = Date.now();
     for (const proxy of this.staticProxies) {
       if (proxy.dailyDate !== today) {
         proxy.dailyDate = today;
         proxy.checksToday = 0;
         proxy.rejectedCount = 0;
-        proxy.cooldownUntil = 0;
+        if (proxy.cooldownUntil <= now) {
+          proxy.cooldownUntil = 0;
+        }
       }
     }
+  }
+
+  validateExitIp(
+    exitIp: string,
+    mode: "list" | "residential",
+  ): { allowed: true } | { allowed: false; reason: string } {
+    const today = getMadridDateKey();
+    const now = Date.now();
+    const record = dbService.getExitIpRecord(exitIp);
+
+    if (record?.cooldownUntil) {
+      const cooldownMs = Date.parse(record.cooldownUntil);
+      if (Number.isFinite(cooldownMs) && cooldownMs > now) {
+        return {
+          allowed: false,
+          reason: `Exit IP ${exitIp} is cooling down until ${record.cooldownUntil} (${record.lastOutcome ?? "BLOCKED"})`,
+        };
+      }
+    }
+
+    if (
+      config.maxChecksPerProxyPerDay > 0 &&
+      record &&
+      record.dailyDate === today &&
+      record.checksToday >= config.maxChecksPerProxyPerDay
+    ) {
+      return {
+        allowed: false,
+        reason: `Exit IP ${exitIp} reached daily limit (${record.checksToday}/${config.maxChecksPerProxyPerDay})`,
+      };
+    }
+
+    // Prevent back-to-back reuse of the exact same exit IP (except single-IP static list)
+    const enforceDistinctIp =
+      mode === "residential" || this.staticProxies.length > 1;
+    if (enforceDistinctIp && exitIp === this.lastUsedExitIp) {
+      return {
+        allowed: false,
+        reason: `Exit IP ${exitIp} matches immediately previous check IP`,
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  markExitIpSelected(exitIp: string, proxyId: string): void {
+    this.lastUsedExitIp = exitIp;
+    dbService.recordExitIpSelected(exitIp, proxyId, getMadridDateKey());
   }
 
   acquire(excludeIds: ReadonlySet<string> = new Set()): SelectedProxy | null {
@@ -223,7 +278,6 @@ class ProxyService {
         extractBaseUsername(config.webshareResidentialUsername ?? "");
       const server = `http://${config.webshareResidentialHost}:${config.webshareResidentialPort}`;
 
-      // Keep advancing until we guarantee a unique session ID never seen before
       let id = "";
       let username = "";
       do {
@@ -250,6 +304,7 @@ class ProxyService {
         mode: "residential",
         server,
         username,
+        exitIp: null,
         playwrightProxy: {
           server,
           username,
@@ -262,7 +317,6 @@ class ProxyService {
       return selected;
     }
 
-    // PROXY_MODE=list: pick a unique proxy that is under cap, cooled down, and != lastUsedProxyId
     this.resetStaleDailyCounters();
     const now = Date.now();
     const total = this.staticProxies.length;
@@ -279,19 +333,15 @@ class ProxyService {
 
     if (eligible.length === 0) return null;
 
-    // Prefer a proxy different from lastUsedProxyId; pick least-recently-used among alternatives
     const distinct = eligible.filter(
       ({ proxy }) => proxy.id !== this.lastUsedProxyId,
     );
 
-    if (distinct.length === 0) {
-      // Only the last-used proxy is eligible right now
-      if (total > 1 || excludeIds.size > 0) {
-        console.warn(
-          `[Proxy] Skipping ${this.lastUsedProxyId} to avoid back-to-back reuse.`,
-        );
-        return null;
-      }
+    if (distinct.length === 0 && (total > 1 || excludeIds.size > 0)) {
+      console.warn(
+        `[Proxy] Skipping ${this.lastUsedProxyId} to avoid back-to-back reuse.`,
+      );
+      return null;
     }
 
     const pool = distinct.length > 0 ? distinct : eligible;
@@ -309,6 +359,7 @@ class ProxyService {
       mode: "list",
       server: chosen.proxy.server,
       username: chosen.proxy.username,
+      exitIp: null,
       playwrightProxy: chosen.proxy.playwrightProxy,
     };
 
@@ -375,56 +426,43 @@ class ProxyService {
     if (!proxy) return;
 
     const today = getMadridDateKey();
+    let proxyCooldownIso: string | null = null;
 
-    if (config.proxyMode !== "list") {
-      const cooldownIso =
-        outcome === "IP_BLOCKED"
-          ? new Date(Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS).toISOString()
-          : null;
-      dbService.recordProxyOutcome(
-        proxy,
-        outcome,
-        today,
-        errorReason,
-        cooldownIso,
-      );
-      if (outcome === "IP_BLOCKED") {
-        console.warn(
-          `[Proxy] ${proxy.id} hit "Información" daily IP block — recorded 24h cooldown.`,
-        );
+    if (config.proxyMode === "list") {
+      const entry = this.staticProxies.find((p) => p.id === proxy.id);
+      if (entry) {
+        this.resetStaleDailyCounters();
+
+        if (outcome === "SUCCESS") {
+          entry.checksToday += 1;
+          entry.rejectedCount = 0;
+          entry.cooldownUntil = 0;
+        } else if (outcome === "IP_BLOCKED") {
+          entry.rejectedCount += 1;
+          entry.cooldownUntil = Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS;
+          proxyCooldownIso = new Date(entry.cooldownUntil).toISOString();
+          console.warn(
+            `[Proxy] ${entry.id} (${proxy.exitIp ?? "unknown IP"}) hit "Información" daily IP block — 24h cooldown until ${proxyCooldownIso}.`,
+          );
+        } else {
+          entry.rejectedCount += 1;
+          const multiplier = Math.min(entry.rejectedCount, 4);
+          entry.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS * multiplier;
+          proxyCooldownIso = new Date(entry.cooldownUntil).toISOString();
+          console.warn(
+            `[Proxy] ${entry.id} (${proxy.exitIp ?? "unknown IP"}) recorded ${outcome} (${errorReason ?? "no detail"}) — cooling down ${(PROXY_COOLDOWN_MS * multiplier) / 60_000} min.`,
+          );
+        }
       }
-      return;
-    }
-
-    const entry = this.staticProxies.find((p) => p.id === proxy.id);
-    if (!entry) {
-      dbService.recordProxyOutcome(proxy, outcome, today, errorReason, null);
-      return;
-    }
-
-    this.resetStaleDailyCounters();
-
-    let cooldownIso: string | null = null;
-
-    if (outcome === "SUCCESS") {
-      entry.checksToday += 1;
-      entry.rejectedCount = 0;
-      entry.cooldownUntil = 0;
     } else if (outcome === "IP_BLOCKED") {
-      entry.rejectedCount += 1;
-      entry.cooldownUntil = Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS;
-      cooldownIso = new Date(entry.cooldownUntil).toISOString();
+      proxyCooldownIso = new Date(
+        Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS,
+      ).toISOString();
       console.warn(
-        `[Proxy] ${entry.id} hit "Información" daily IP block — cooling down for 24h (until ${cooldownIso}).`,
+        `[Proxy] Residential IP ${proxy.exitIp ?? proxy.id} hit "Información" daily IP block — 24h cooldown until ${proxyCooldownIso}.`,
       );
-    } else {
-      entry.rejectedCount += 1;
-      const multiplier = Math.min(entry.rejectedCount, 4);
-      entry.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS * multiplier;
-      cooldownIso = new Date(entry.cooldownUntil).toISOString();
-      console.warn(
-        `[Proxy] ${entry.id} recorded ${outcome} (${errorReason ?? "no detail"}) — cooling down ${(PROXY_COOLDOWN_MS * multiplier) / 60_000} min.`,
-      );
+    } else if (outcome !== "SUCCESS") {
+      proxyCooldownIso = new Date(Date.now() + PROXY_COOLDOWN_MS).toISOString();
     }
 
     dbService.recordProxyOutcome(
@@ -432,8 +470,34 @@ class ProxyService {
       outcome,
       today,
       errorReason,
-      cooldownIso,
+      proxyCooldownIso,
     );
+
+    // Record outcome & cooldown against the actual resolved exit IP
+    if (proxy.exitIp) {
+      let exitIpCooldownIso: string | null = null;
+
+      if (outcome === "IP_BLOCKED") {
+        exitIpCooldownIso = new Date(
+          Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS,
+        ).toISOString();
+      } else if (outcome !== "SUCCESS") {
+        const existingIp = dbService.getExitIpRecord(proxy.exitIp);
+        const multiplier = Math.min((existingIp?.errorCount ?? 0) + 1, 4);
+        exitIpCooldownIso = new Date(
+          Date.now() + PROXY_COOLDOWN_MS * multiplier,
+        ).toISOString();
+      }
+
+      dbService.recordExitIpOutcome(
+        proxy.exitIp,
+        proxy.id,
+        outcome,
+        today,
+        errorReason,
+        exitIpCooldownIso,
+      );
+    }
   }
 }
 

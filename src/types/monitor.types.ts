@@ -9,6 +9,19 @@ export type CheckStatus =
 
 export type ProxyOutcome = "SUCCESS" | "REJECTED" | "IP_BLOCKED" | "ERROR";
 
+export interface ExitIpRecord {
+  exitIp: string;
+  lastProxyId: string | null;
+  lastUsedAt: string | null;
+  lastOutcome: ProxyOutcome | null;
+  lastErrorAt: string | null;
+  lastErrorReason: string | null;
+  errorCount: number;
+  dailyDate: string;
+  checksToday: number;
+  cooldownUntil: string | null;
+}
+
 export interface ProxyRecord {
   proxyId: string;
   mode: "list" | "residential";

@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import type { Applicant, CreateApplicantInput } from "@/types/applicant.types";
 import type {
   CheckStatus,
+  ExitIpRecord,
   ProxyOutcome,
   ProxyRecord,
 } from "@/types/monitor.types";
@@ -32,6 +33,19 @@ interface ProxyRecordRow {
   mode: "list" | "residential";
   server: string;
   username: string | null;
+  last_used_at: string | null;
+  last_outcome: ProxyOutcome | null;
+  last_error_at: string | null;
+  last_error_reason: string | null;
+  error_count: number;
+  daily_date: string;
+  checks_today: number;
+  cooldown_until: string | null;
+}
+
+interface ExitIpRecordRow {
+  exit_ip: string;
+  last_proxy_id: string | null;
   last_used_at: string | null;
   last_outcome: ProxyOutcome | null;
   last_error_at: string | null;
@@ -85,6 +99,21 @@ function mapProxyRow(row: ProxyRecordRow): ProxyRecord {
   };
 }
 
+function mapExitIpRow(row: ExitIpRecordRow): ExitIpRecord {
+  return {
+    exitIp: row.exit_ip,
+    lastProxyId: row.last_proxy_id,
+    lastUsedAt: row.last_used_at,
+    lastOutcome: row.last_outcome,
+    lastErrorAt: row.last_error_at,
+    lastErrorReason: row.last_error_reason,
+    errorCount: row.error_count,
+    dailyDate: row.daily_date,
+    checksToday: row.checks_today,
+    cooldownUntil: row.cooldown_until,
+  };
+}
+
 class DbService {
   private readonly db: Database.Database;
 
@@ -120,6 +149,19 @@ class DbService {
         mode TEXT NOT NULL,
         server TEXT NOT NULL,
         username TEXT,
+        last_used_at TEXT,
+        last_outcome TEXT,
+        last_error_at TEXT,
+        last_error_reason TEXT,
+        error_count INTEGER NOT NULL DEFAULT 0,
+        daily_date TEXT NOT NULL,
+        checks_today INTEGER NOT NULL DEFAULT 0,
+        cooldown_until TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS exit_ip_records (
+        exit_ip TEXT PRIMARY KEY,
+        last_proxy_id TEXT,
         last_used_at TEXT,
         last_outcome TEXT,
         last_error_at TEXT,
@@ -240,7 +282,7 @@ class DbService {
       .run(status, new Date().toISOString(), id);
   }
 
-  // --- Proxy Records ---
+  // --- Proxy Session Records ---
 
   recordProxySelected(proxy: ProxyIdentity, dailyDate: string): void {
     const nowIso = new Date().toISOString();
@@ -360,6 +402,120 @@ class DbService {
       )
       .all(limit) as ProxyRecordRow[];
     return rows.map(mapProxyRow);
+  }
+
+  // --- Resolved Exit IP Records ---
+
+  recordExitIpSelected(
+    exitIp: string,
+    proxyId: string,
+    dailyDate: string,
+  ): void {
+    const nowIso = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+        INSERT INTO exit_ip_records (
+          exit_ip, last_proxy_id, last_used_at, daily_date, checks_today
+        )
+        VALUES (@exitIp, @proxyId, @nowIso, @dailyDate, 0)
+        ON CONFLICT(exit_ip) DO UPDATE SET
+          last_proxy_id = excluded.last_proxy_id,
+          last_used_at = excluded.last_used_at,
+          checks_today = CASE
+            WHEN exit_ip_records.daily_date = excluded.daily_date THEN exit_ip_records.checks_today
+            ELSE 0
+          END,
+          daily_date = excluded.daily_date
+      `,
+      )
+      .run({ exitIp, proxyId, nowIso, dailyDate });
+  }
+
+  recordExitIpOutcome(
+    exitIp: string,
+    proxyId: string,
+    outcome: ProxyOutcome,
+    dailyDate: string,
+    errorReason?: string,
+    cooldownUntil?: string | null,
+  ): void {
+    const nowIso = new Date().toISOString();
+    const isError = outcome !== "SUCCESS";
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO exit_ip_records (
+          exit_ip, last_proxy_id, last_used_at, last_outcome,
+          last_error_at, last_error_reason, error_count, daily_date, checks_today, cooldown_until
+        )
+        VALUES (
+          @exitIp, @proxyId, @nowIso, @outcome,
+          @lastErrorAt, @lastErrorReason, @initialErrorCount, @dailyDate, @initialChecks, @cooldownUntil
+        )
+        ON CONFLICT(exit_ip) DO UPDATE SET
+          last_proxy_id = excluded.last_proxy_id,
+          last_outcome = excluded.last_outcome,
+          last_error_at = CASE
+            WHEN @isError = 1 THEN @nowIso
+            ELSE exit_ip_records.last_error_at
+          END,
+          last_error_reason = CASE
+            WHEN @isError = 1 THEN @lastErrorReason
+            ELSE exit_ip_records.last_error_reason
+          END,
+          error_count = CASE
+            WHEN @isError = 1 THEN exit_ip_records.error_count + 1
+            ELSE exit_ip_records.error_count
+          END,
+          checks_today = CASE
+            WHEN exit_ip_records.daily_date = excluded.daily_date
+              THEN exit_ip_records.checks_today + @initialChecks
+            ELSE @initialChecks
+          END,
+          daily_date = excluded.daily_date,
+          cooldown_until = @cooldownUntil
+      `,
+      )
+      .run({
+        exitIp,
+        proxyId,
+        nowIso,
+        outcome,
+        isError: isError ? 1 : 0,
+        lastErrorAt: isError ? nowIso : null,
+        lastErrorReason: isError ? (errorReason ?? outcome) : null,
+        initialErrorCount: isError ? 1 : 0,
+        dailyDate,
+        initialChecks: outcome === "SUCCESS" ? 1 : 0,
+        cooldownUntil: cooldownUntil ?? null,
+      });
+  }
+
+  getExitIpRecord(exitIp: string): ExitIpRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM exit_ip_records WHERE exit_ip = ?")
+      .get(exitIp) as ExitIpRecordRow | undefined;
+    return row ? mapExitIpRow(row) : null;
+  }
+
+  getLastUsedExitIp(): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT exit_ip FROM exit_ip_records WHERE last_used_at IS NOT NULL ORDER BY last_used_at DESC LIMIT 1",
+      )
+      .get() as { exit_ip: string } | undefined;
+    return row?.exit_ip ?? null;
+  }
+
+  getExitIpErrors(limit = 20): ExitIpRecord[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM exit_ip_records WHERE error_count > 0 ORDER BY last_error_at DESC LIMIT ?",
+      )
+      .all(limit) as ExitIpRecordRow[];
+    return rows.map(mapExitIpRow);
   }
 
   close(): void {

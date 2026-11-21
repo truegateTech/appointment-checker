@@ -1,6 +1,9 @@
 import { checkNieSlots } from "@/checkers/slot-checker";
 import { config } from "@/config/env";
-import type { PageError } from "@/services/browser.service";
+import {
+  type PageError,
+  ProxyPreflightError,
+} from "@/services/browser.service";
 import { dbService } from "@/services/db.service";
 import { logger } from "@/services/logger.service";
 import { proxyService } from "@/services/proxy.service";
@@ -14,6 +17,7 @@ import {
 
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 const MAX_PROXY_RETRIES = 2;
+const MAX_PREFLIGHT_SKIPS = 5;
 
 function randomInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -160,17 +164,23 @@ export class SlotPoller {
       this.cursor = (this.cursor + 1) % applicants.length;
 
       const applicantLabel = `${applicant.fullName} (${applicant.nie}) — ${applicant.provinceName}`;
-      const maxAttempts = proxyService.isEnabled() ? MAX_PROXY_RETRIES + 1 : 1;
+      const maxPortalAttempts = proxyService.isEnabled()
+        ? MAX_PROXY_RETRIES + 1
+        : 1;
       const attemptedProxyIds = new Set<string>();
+      let portalAttempts = 0;
+      let preflightSkips = 0;
 
-      // 4. Execute check; immediately switch to a fresh unique proxy on WAF/session/proxy error
-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        if (!this.running) break;
-
+      // 4. Execute check; rotate immediately on pre-flight IP conflicts or portal errors
+      while (
+        this.running &&
+        portalAttempts < maxPortalAttempts &&
+        preflightSkips <= MAX_PREFLIGHT_SKIPS
+      ) {
         const selectedProxy = proxyService.acquire(attemptedProxyIds);
         if (proxyService.isEnabled() && !selectedProxy) {
           console.warn(
-            `[Proxy] No unique proxy available for attempt ${attempt}/${maxAttempts}.`,
+            "[Proxy] No eligible unique proxy available for this cycle.",
           );
           break;
         }
@@ -178,15 +188,17 @@ export class SlotPoller {
         if (selectedProxy) {
           attemptedProxyIds.add(selectedProxy.id);
           console.log(
-            `[Proxy] Attempt ${attempt}/${maxAttempts} using ${selectedProxy.label}`,
+            `[Proxy] Attempt ${portalAttempts + 1}/${maxPortalAttempts} using ${selectedProxy.label}`,
           );
         }
 
-        ranCheck = true;
         const startedAt = Date.now();
 
         try {
           const result = await checkNieSlots(applicant, selectedProxy);
+          portalAttempts += 1;
+          ranCheck = true;
+
           const durationMs = Date.now() - startedAt;
           lastStatus = result.status;
 
@@ -211,7 +223,9 @@ export class SlotPoller {
 
           const detailParts = [
             `Applicant: ${applicantLabel}`,
-            selectedProxy ? `Proxy: ${selectedProxy.label}` : null,
+            selectedProxy
+              ? `Proxy: ${selectedProxy.label}${selectedProxy.exitIp ? ` [exitIp=${selectedProxy.exitIp}]` : ""}`
+              : null,
             result.details ?? null,
           ].filter((part): part is string => part !== null);
 
@@ -291,17 +305,31 @@ export class SlotPoller {
           if (
             proxyService.isEnabled() &&
             isRetryableStatus &&
-            attempt < maxAttempts
+            portalAttempts < maxPortalAttempts
           ) {
             console.log(
-              `[Poller] ${result.status} on ${selectedProxy?.id ?? "proxy"} — immediately retrying with a new proxy...`,
+              `[Poller] ${result.status} on ${selectedProxy?.exitIp ?? selectedProxy?.id ?? "proxy"} — immediately retrying with a new proxy...`,
             );
             continue;
           }
 
           break;
         } catch (err: unknown) {
+          if (err instanceof ProxyPreflightError) {
+            preflightSkips += 1;
+            console.warn(
+              `[Proxy] Pre-flight skip (${preflightSkips}/${MAX_PREFLIGHT_SKIPS}): ${err.message}`,
+            );
+            if (err.proxyUnreachable) {
+              proxyService.reportOutcome(selectedProxy, "ERROR", err.message);
+            }
+            continue;
+          }
+
+          portalAttempts += 1;
+          ranCheck = true;
           lastStatus = "ERROR";
+
           const error = (
             err instanceof Error ? err : new Error(String(err))
           ) as PageError;
@@ -328,9 +356,9 @@ export class SlotPoller {
               );
           }
 
-          if (proxyService.isEnabled() && attempt < maxAttempts) {
+          if (proxyService.isEnabled() && portalAttempts < maxPortalAttempts) {
             console.log(
-              `[Poller] Error on ${selectedProxy?.id ?? "proxy"} (${error.message}) — immediately retrying with a new proxy...`,
+              `[Poller] Error on ${selectedProxy?.exitIp ?? selectedProxy?.id ?? "proxy"} (${error.message}) — immediately retrying with a new proxy...`,
             );
             continue;
           }
