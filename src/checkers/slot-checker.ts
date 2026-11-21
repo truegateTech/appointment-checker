@@ -85,6 +85,19 @@ async function getBodyText(page: Page): Promise<string> {
 function summarizeText(text: string, maxLen = 220): string {
   return text.replace(/\s+/g, " ").trim().slice(0, maxLen);
 }
+async function captureScreenshot(
+  page: Page,
+  prefix: string,
+): Promise<string | undefined> {
+  if (page.isClosed()) return undefined;
+  const screenshotPath = logger.getScreenshotPath(prefix);
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    return screenshotPath;
+  } catch {
+    return undefined;
+  }
+}
 
 async function detectWebsiteError(
   page: Page,
@@ -105,6 +118,7 @@ async function detectWebsiteError(
       message: `HTTP ${httpStatus} error during "${step}"`,
       details: snippet ? `Snippet: ${snippet}` : undefined,
       url: page.url(),
+      screenshotPath: await captureScreenshot(page, `http-${httpStatus}`),
     };
   }
 
@@ -118,6 +132,7 @@ async function detectWebsiteError(
       message: `Access blocked / rejected during "${step}" (${blockedMatch.source})`,
       details: `Snippet: ${summarizeText(bodyText || title)}`,
       url: page.url(),
+      screenshotPath: await captureScreenshot(page, "rejected"),
     };
   }
 
@@ -131,6 +146,7 @@ async function detectWebsiteError(
       message: `Portal error page during "${step}" (${portalErrMatch.source})`,
       details: `Snippet: ${summarizeText(bodyText || title)}`,
       url: page.url(),
+      screenshotPath: await captureScreenshot(page, "portal-error"),
     };
   }
 
@@ -146,6 +162,7 @@ async function detectWebsiteError(
         message: `Portal error alert during "${step}"`,
         details: errText,
         url: page.url(),
+        screenshotPath: await captureScreenshot(page, "portal-alert"),
       };
     }
   }
@@ -414,11 +431,11 @@ export async function checkNieSlots(
             status: "SESSION_EXPIRED",
             message: "Portal session expired before completing check",
             url: page.url(),
+            screenshotPath: await captureScreenshot(page, "session-expired"),
           },
         };
       }
 
-      // Heading "Información" on the final page indicates this IP is shadow-blocked for the day
       if (await hasInfoBlockHeading(page, bodyText)) {
         return {
           result: {
@@ -427,6 +444,7 @@ export async function checkNieSlots(
               'Detected "Información" heading on final page — IP blocked for the day',
             details: `Snippet: ${summarizeText(bodyText)}`,
             url: page.url(),
+            screenshotPath: await captureScreenshot(page, "ip-blocked"),
           },
         };
       }
@@ -437,10 +455,10 @@ export async function checkNieSlots(
             status: "NO_SLOTS",
             message: "No appointment slots are currently available",
             url: page.url(),
+            screenshotPath: await captureScreenshot(page, "no-slots"),
           },
         };
       }
-
       const positive = await detectAvailableSlot(page, bodyText);
       if (positive.matched) {
         const screenshotPath = logger.getScreenshotPath("slot-available");

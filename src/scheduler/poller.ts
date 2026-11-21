@@ -261,19 +261,24 @@ export class SlotPoller {
                 durationMs,
                 message: result.message,
                 url: result.url,
+                screenshotPath: result.screenshotPath,
               })
               .catch((tgErr: unknown) =>
                 console.error("Failed to send dev status notification:", tgErr),
               );
           } else if (
-            result.status === "REJECTED" &&
+            (result.status === "REJECTED" || result.status === "IP_BLOCKED") &&
             stats.consecutiveFailures === config.errorAlertThreshold
           ) {
             await telegram
               .sendFailureAlert({
-                title: "Portal Repeatedly Rejecting Requests",
+                title:
+                  result.status === "IP_BLOCKED"
+                    ? "Portal IP Blocked (Información)"
+                    : "Portal Repeatedly Rejecting Requests",
                 reason: result.message,
                 stats,
+                screenshotPath: result.screenshotPath,
               })
               .catch((tgErr: unknown) =>
                 console.error(
