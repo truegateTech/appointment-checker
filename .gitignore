@@ -8,5 +8,7 @@ node_modules/
 /playwright/.auth/
 /data
 /dist
+/logs/**
+
 
 *.env

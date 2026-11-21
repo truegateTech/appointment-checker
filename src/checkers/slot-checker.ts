@@ -6,6 +6,7 @@ import type { Applicant } from "@/types/applicant.types";
 import type { SlotCheckResult } from "@/types/monitor.types";
 import { humanClick, humanPause, humanType } from "@/utils/human";
 import { randomInt } from "node:crypto";
+import { SelectedProxy } from "@/services/proxy.service";
 
 const NO_SLOTS_MESSAGES = [
   "En este momento no hay citas disponibles.\n\nEn breve, la Oficina pondrá a su disposición nuevas citas.",
@@ -194,160 +195,165 @@ async function detectAvailableSlot(
 
 export async function checkNieSlots(
   applicant: Applicant,
+  proxy?: SelectedProxy | null,
 ): Promise<SlotCheckResult> {
   const targetUrl = applicant.provinceUrl || config.appointmentUrl;
 
-  return browserService.withPage<SlotCheckResult>(targetUrl, async (page) => {
-    // Step 1: Reload or navigate the single tab to the province page
-    if (page.url() === targetUrl) {
-      await page.reload({ waitUntil: "domcontentloaded" });
-    } else {
-      await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    }
+  return browserService.withPage<SlotCheckResult>(
+    targetUrl,
+    async (page) => {
+      // Step 1: Reload or navigate the single tab to the province page
+      if (page.url() === targetUrl) {
+        await page.reload({ waitUntil: "domcontentloaded" });
+      } else {
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+      }
 
-    if (await isRejected(page)) {
-      return { result: rejectedResult(page, "initial load") };
-    }
-    await humanPause(1200, 2600);
+      if (await isRejected(page)) {
+        return { result: rejectedResult(page, "initial load") };
+      }
+      await humanPause(1200, 2600);
 
-    const provinceHeader = page.getByText(
-      "PROVINCIA SELECCIONADA Importante: lee toda la información de esta página,",
-    );
-    if (await provinceHeader.isVisible().catch(() => false)) {
-      await humanClick(page, provinceHeader);
-      await humanPause(600, 1400);
-    }
+      const provinceHeader = page.getByText(
+        "PROVINCIA SELECCIONADA Importante: lee toda la información de esta página,",
+      );
+      if (await provinceHeader.isVisible().catch(() => false)) {
+        await humanClick(page, provinceHeader);
+        await humanPause(600, 1400);
+      }
 
-    // Step 2: Locate and select the procedure dynamically
-    const procedureSelect = await findProcedureSelect(
-      page,
-      applicant.procedureCode,
-    );
-    await humanClick(page, procedureSelect);
-    await humanPause(300, 700);
-    await procedureSelect.selectOption(applicant.procedureCode);
-    await humanPause(700, 1500);
+      // Step 2: Locate and select the procedure dynamically
+      const procedureSelect = await findProcedureSelect(
+        page,
+        applicant.procedureCode,
+      );
+      await humanClick(page, procedureSelect);
+      await humanPause(300, 700);
+      await procedureSelect.selectOption(applicant.procedureCode);
+      await humanPause(700, 1500);
 
-    await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
-    await page.waitForLoadState("domcontentloaded");
-    if (await isRejected(page)) {
-      return { result: rejectedResult(page, "procedure selection") };
-    }
+      await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
+      await page.waitForLoadState("domcontentloaded");
+      if (await isRejected(page)) {
+        return { result: rejectedResult(page, "procedure selection") };
+      }
 
-    // Step 3: Enter applicant details
-    await humanPause(1000, 2200);
+      // Step 3: Enter applicant details
+      await humanPause(1000, 2200);
 
-    const enterButton = page.locator("#btnEntrar");
-    await enterButton.waitFor({ state: "visible", timeout: 20_000 });
-    await humanClick(page, enterButton);
-    await page.waitForLoadState("domcontentloaded");
-    await humanPause(900, 1900);
+      const enterButton = page.locator("#btnEntrar");
+      await enterButton.waitFor({ state: "visible", timeout: 20_000 });
+      await humanClick(page, enterButton);
+      await page.waitForLoadState("domcontentloaded");
+      await humanPause(900, 1900);
 
-    const nieInput = page.getByRole("textbox", {
-      name: "* N.I.E. Campo obligatorio",
-    });
-    await nieInput.waitFor({ state: "visible", timeout: 20_000 });
-    await humanClick(page, nieInput);
-    await humanType(nieInput, applicant.nie);
-    await humanPause(500, 1100);
-
-    const nameInput = page.getByRole("textbox", {
-      name: "*Nombre y apellidos Campo",
-    });
-    await humanClick(page, nameInput);
-    await humanType(nameInput, applicant.fullName);
-    await humanPause(700, 1500);
-
-    // Select a random valid option for the required País de nacionalidad dropdown (#txtPaisNac)
-    const pickedCountry = await selectRandomOption(
-      page,
-      page.locator("#txtPaisNac"),
-    );
-
-    if (pickedCountry) {
-      console.log(`Selected random country/state option: ${pickedCountry}`);
+      const nieInput = page.getByRole("textbox", {
+        name: "* N.I.E. Campo obligatorio",
+      });
+      await nieInput.waitFor({ state: "visible", timeout: 20_000 });
+      await humanClick(page, nieInput);
+      await humanType(nieInput, applicant.nie);
       await humanPause(500, 1100);
-    }
 
-    await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
-    await page.waitForLoadState("domcontentloaded");
-    await humanPause(1100, 2400);
+      const nameInput = page.getByRole("textbox", {
+        name: "*Nombre y apellidos Campo",
+      });
+      await humanClick(page, nameInput);
+      await humanType(nameInput, applicant.fullName);
+      await humanPause(700, 1500);
 
-    const solicitarBtn = page.getByRole("button", { name: "Solicitar Cita" });
-    await solicitarBtn.waitFor({ state: "visible", timeout: 20_000 });
-    await humanClick(page, solicitarBtn);
+      // Select a random valid option for the required País de nacionalidad dropdown (#txtPaisNac)
+      const pickedCountry = await selectRandomOption(
+        page,
+        page.locator("#txtPaisNac"),
+      );
 
-    await solicitarBtn
-      .waitFor({ state: "hidden", timeout: 20_000 })
-      .catch(() => {});
-    await page.waitForLoadState("domcontentloaded");
-    await page
-      .waitForLoadState("networkidle", { timeout: 10_000 })
-      .catch(() => {});
-    await humanPause(800, 1600);
+      if (pickedCountry) {
+        console.log(`Selected random country/state option: ${pickedCountry}`);
+        await humanPause(500, 1100);
+      }
 
-    // Step 4: Verify slot availability (strict positive check only)
-    const bodyText = await getBodyText(page);
+      await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
+      await page.waitForLoadState("domcontentloaded");
+      await humanPause(1100, 2400);
 
-    if (URL_REJECTED_PATTERN.test(bodyText)) {
-      return { result: rejectedResult(page, "slot verification") };
-    }
+      const solicitarBtn = page.getByRole("button", { name: "Solicitar Cita" });
+      await solicitarBtn.waitFor({ state: "visible", timeout: 20_000 });
+      await humanClick(page, solicitarBtn);
 
-    if (SESSION_EXPIRED_PATTERN.test(bodyText)) {
-      return {
-        result: {
-          status: "SESSION_EXPIRED",
-          message: "Portal session expired before completing check",
-          url: page.url(),
-        },
-      };
-    }
+      await solicitarBtn
+        .waitFor({ state: "hidden", timeout: 20_000 })
+        .catch(() => {});
+      await page.waitForLoadState("domcontentloaded");
+      await page
+        .waitForLoadState("networkidle", { timeout: 10_000 })
+        .catch(() => {});
+      await humanPause(800, 1600);
 
-    if (NO_SLOTS_PATTERN.test(bodyText)) {
-      return {
-        result: {
-          status: "NO_SLOTS",
-          message: "No appointment slots are currently available",
-          url: page.url(),
-        },
-      };
-    }
+      // Step 4: Verify slot availability (strict positive check only)
+      const bodyText = await getBodyText(page);
 
-    const positive = await detectAvailableSlot(page, bodyText);
-    if (positive.matched) {
-      const screenshotPath = logger.getScreenshotPath("slot-available");
+      if (URL_REJECTED_PATTERN.test(bodyText)) {
+        return { result: rejectedResult(page, "slot verification") };
+      }
+
+      if (SESSION_EXPIRED_PATTERN.test(bodyText)) {
+        return {
+          result: {
+            status: "SESSION_EXPIRED",
+            message: "Portal session expired before completing check",
+            url: page.url(),
+          },
+        };
+      }
+
+      if (NO_SLOTS_PATTERN.test(bodyText)) {
+        return {
+          result: {
+            status: "NO_SLOTS",
+            message: "No appointment slots are currently available",
+            url: page.url(),
+          },
+        };
+      }
+
+      const positive = await detectAvailableSlot(page, bodyText);
+      if (positive.matched) {
+        const screenshotPath = logger.getScreenshotPath("slot-available");
+        await page
+          .screenshot({ path: screenshotPath, fullPage: true })
+          .catch(() => {});
+
+        return {
+          keepTabOpen: config.keepTabOnSlot,
+          result: {
+            status: "AVAILABLE",
+            message: `NIE appointment slots AVAILABLE (${positive.stage})!`,
+            details: positive.details,
+            url: page.url(),
+            screenshotPath,
+          },
+        };
+      }
+
+      // Unrecognized portal screen (maintenance, unexpected error, CAPTCHA, etc.)
+      const snippet = bodyText.replace(/\s+/g, " ").slice(0, 220);
+      const screenshotPath = logger.getScreenshotPath("unknown");
       await page
         .screenshot({ path: screenshotPath, fullPage: true })
         .catch(() => {});
 
       return {
-        keepTabOpen: config.keepTabOnSlot,
         result: {
-          status: "AVAILABLE",
-          message: `NIE appointment slots AVAILABLE (${positive.stage})!`,
-          details: positive.details,
+          status: "UNKNOWN",
+          message:
+            "Unrecognized response page (no positive slot indicator found)",
+          details: `Snippet: ${snippet}`,
           url: page.url(),
           screenshotPath,
         },
       };
-    }
-
-    // Unrecognized portal screen (maintenance, unexpected error, CAPTCHA, etc.)
-    const snippet = bodyText.replace(/\s+/g, " ").slice(0, 220);
-    const screenshotPath = logger.getScreenshotPath("unknown");
-    await page
-      .screenshot({ path: screenshotPath, fullPage: true })
-      .catch(() => {});
-
-    return {
-      result: {
-        status: "UNKNOWN",
-        message:
-          "Unrecognized response page (no positive slot indicator found)",
-        details: `Snippet: ${snippet}`,
-        url: page.url(),
-        screenshotPath,
-      },
-    };
-  });
+    },
+    proxy,
+  );
 }

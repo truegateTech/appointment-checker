@@ -3,6 +3,7 @@ import { browserService } from "@/services/browser.service";
 import { dbService } from "@/services/db.service";
 import { logger } from "@/services/logger.service";
 import { telegram } from "@/services/telegram.service";
+import { proxyService } from "./services/proxy.service";
 
 const poller = new SlotPoller();
 
@@ -20,6 +21,9 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 async function main(): Promise<void> {
   console.log("[Poller] Starting NIE Slot Monitor (Single-Execution Mode)...");
+
+  await proxyService.init();
+  console.log("[Poller] Started Proxy Service...");
 
   await browserService.connect();
   console.log("[Poller] Connected to Chrome over CDP.");
