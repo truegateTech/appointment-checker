@@ -3,7 +3,7 @@ import {
   type Browser,
   type BrowserContext,
   type Page,
-} from "playwright";
+} from "patchright";
 import { config } from "@/config/env";
 import { logger } from "@/services/logger.service";
 import type { SelectedProxy } from "@/services/proxy.service";
@@ -52,7 +52,10 @@ class BrowserService {
         headless: config.headless,
         channel: config.browserChannel,
         proxy: { server: "http://per-context" },
-        args: ["--disable-blink-features=AutomationControlled"],
+        args: [
+          "--disable-blink-features=AutomationControlled",
+          "--start-maximized",
+        ],
       });
     }
 
@@ -135,7 +138,8 @@ class BrowserService {
           proxy: proxy.playwrightProxy,
           locale: "es-ES",
           timezoneId: "Europe/Madrid",
-          viewport: { width: 1366, height: 768 },
+          // viewport: { width: 1466, height: 740 },
+          viewport: null,
         });
         contextToClose = context;
 

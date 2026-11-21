@@ -1,12 +1,10 @@
-import type { Locator, Page } from "playwright";
+import type { Locator, Page } from "patchright";
 import { config } from "@/config/env";
 import { browserService } from "@/services/browser.service";
 import { logger } from "@/services/logger.service";
+import type { SelectedProxy } from "@/services/proxy.service";
 import type { Applicant } from "@/types/applicant.types";
 import type { SlotCheckResult } from "@/types/monitor.types";
-import { humanClick, humanPause, humanType } from "@/utils/human";
-import { randomInt } from "node:crypto";
-import { SelectedProxy } from "@/services/proxy.service";
 
 const NO_SLOTS_MESSAGES = [
   "En este momento no hay citas disponibles.\n\nEn breve, la Oficina pondrá a su disposición nuevas citas.",
@@ -58,49 +56,10 @@ function rejectedResult(page: Page, step: string): SlotCheckResult {
   };
 }
 
-async function selectRandomOption(
-  page: Page,
-  locator: Locator,
-): Promise<string | null> {
-  if (!(await locator.isVisible().catch(() => false))) {
-    return null;
-  }
-
-  const validOptions = await locator.locator("option").evaluateAll((opts) =>
-    opts
-      .map((opt) => {
-        const el = opt as HTMLOptionElement;
-        return {
-          value: el.value.trim(),
-          label: (el.textContent ?? "").trim(),
-          disabled: el.disabled,
-        };
-      })
-      .filter(
-        (o) =>
-          !o.disabled &&
-          o.value !== "" &&
-          o.value !== "-1" &&
-          o.value !== "0" &&
-          !/^(seleccione|elija|choose)/i.test(o.label),
-      ),
-  );
-
-  if (validOptions.length === 0) return null;
-
-  const picked = validOptions[randomInt(0, validOptions.length - 1)];
-  if (!picked) return null;
-
-  await humanClick(page, locator);
-  await humanPause(300, 750);
-  await locator.selectOption(picked.value);
-  return `${picked.label} (${picked.value})`;
-}
 async function findProcedureSelect(
   page: Page,
   procedureCode: string,
 ): Promise<Locator> {
-  // Match whichever visible <select> holds this procedure code (works for tramiteGrupo[0] or [1])
   const byOption = page
     .locator(`select:has(option[value="${procedureCode}"])`)
     .first();
@@ -129,11 +88,44 @@ async function findProcedureSelect(
   }
 }
 
+async function selectRandomOption(locator: Locator): Promise<string | null> {
+  if (!(await locator.isVisible().catch(() => false))) {
+    return null;
+  }
+
+  const validOptions = await locator.locator("option").evaluateAll((opts) =>
+    opts
+      .map((opt) => {
+        const el = opt as HTMLOptionElement;
+        return {
+          value: el.value.trim(),
+          label: (el.textContent ?? "").trim(),
+          disabled: el.disabled,
+        };
+      })
+      .filter(
+        (o) =>
+          !o.disabled &&
+          o.value !== "" &&
+          o.value !== "-1" &&
+          o.value !== "0" &&
+          !/^(seleccione|elija|choose)/i.test(o.label),
+      ),
+  );
+
+  if (validOptions.length === 0) return null;
+
+  const picked = validOptions[Math.floor(Math.random() * validOptions.length)];
+  if (!picked) return null;
+
+  await locator.selectOption(picked.value);
+  return `${picked.label} (${picked.value})`;
+}
+
 async function detectAvailableSlot(
   page: Page,
   bodyText: string,
 ): Promise<PositiveDetectionResult> {
-  // Never treat as available if a known no-slots message is on screen
   if (NO_SLOTS_PATTERN.test(bodyText)) {
     return { matched: false };
   }
@@ -147,7 +139,7 @@ async function detectAvailableSlot(
     };
   }
 
-  // 2. Office selection screen: require an actual visible #idSede dropdown with real options
+  // 2. Office selection screen: require visible #idSede dropdown with valid options
   const officeSelect = page.locator("select#idSede");
   if (await officeSelect.isVisible().catch(() => false)) {
     const offices = await officeSelect.locator("option").evaluateAll((opts) =>
@@ -175,7 +167,7 @@ async function detectAvailableSlot(
     }
   }
 
-  // 3. Contact details screen (reached directly when only one office is open)
+  // 3. Contact details screen (reached directly when a single office is open)
   const phoneInput = page.locator("#txtTelefonoCitado");
   const emailInput = page.locator("#emailUNO");
   const hasContactForm =
@@ -202,7 +194,7 @@ export async function checkNieSlots(
   return browserService.withPage<SlotCheckResult>(
     targetUrl,
     async (page) => {
-      // Step 1: Reload or navigate the single tab to the province page
+      // Step 1: Load province page
       if (page.url() === targetUrl) {
         await page.reload({ waitUntil: "domcontentloaded" });
       } else {
@@ -212,74 +204,44 @@ export async function checkNieSlots(
       if (await isRejected(page)) {
         return { result: rejectedResult(page, "initial load") };
       }
-      await humanPause(1200, 2600);
 
-      const provinceHeader = page.getByText(
-        "PROVINCIA SELECCIONADA Importante: lee toda la información de esta página,",
-      );
-      if (await provinceHeader.isVisible().catch(() => false)) {
-        await humanClick(page, provinceHeader);
-        await humanPause(600, 1400);
-      }
-
-      // Step 2: Locate and select the procedure dynamically
+      // Step 2: Select procedure and submit
       const procedureSelect = await findProcedureSelect(
         page,
         applicant.procedureCode,
       );
-      await humanClick(page, procedureSelect);
-      await humanPause(300, 700);
       await procedureSelect.selectOption(applicant.procedureCode);
-      await humanPause(700, 1500);
-
-      await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
+      await page.getByRole("button", { name: "Aceptar" }).click();
       await page.waitForLoadState("domcontentloaded");
+
       if (await isRejected(page)) {
         return { result: rejectedResult(page, "procedure selection") };
       }
 
       // Step 3: Enter applicant details
-      await humanPause(1000, 2200);
-
-      const enterButton = page.locator("#btnEntrar");
-      await enterButton.waitFor({ state: "visible", timeout: 20_000 });
-      await humanClick(page, enterButton);
+      await page.locator("#btnEntrar").click();
       await page.waitForLoadState("domcontentloaded");
-      await humanPause(900, 1900);
 
-      const nieInput = page.getByRole("textbox", {
-        name: "* N.I.E. Campo obligatorio",
-      });
-      await nieInput.waitFor({ state: "visible", timeout: 20_000 });
-      await humanClick(page, nieInput);
-      await humanType(nieInput, applicant.nie);
-      await humanPause(500, 1100);
+      await page
+        .getByRole("textbox", { name: "* N.I.E. Campo obligatorio" })
+        .fill(applicant.nie);
 
-      const nameInput = page.getByRole("textbox", {
-        name: "*Nombre y apellidos Campo",
-      });
-      await humanClick(page, nameInput);
-      await humanType(nameInput, applicant.fullName);
-      await humanPause(700, 1500);
+      await page
+        .getByRole("textbox", { name: "*Nombre y apellidos Campo" })
+        .fill(applicant.fullName);
 
-      // Select a random valid option for the required País de nacionalidad dropdown (#txtPaisNac)
       const pickedCountry = await selectRandomOption(
-        page,
         page.locator("#txtPaisNac"),
       );
-
       if (pickedCountry) {
-        console.log(`Selected random country/state option: ${pickedCountry}`);
-        await humanPause(500, 1100);
+        console.log(`[Form] Selected #txtPaisNac option: ${pickedCountry}`);
       }
 
-      await humanClick(page, page.getByRole("button", { name: "Aceptar" }));
+      await page.getByRole("button", { name: "Aceptar" }).click();
       await page.waitForLoadState("domcontentloaded");
-      await humanPause(1100, 2400);
 
       const solicitarBtn = page.getByRole("button", { name: "Solicitar Cita" });
-      await solicitarBtn.waitFor({ state: "visible", timeout: 20_000 });
-      await humanClick(page, solicitarBtn);
+      await solicitarBtn.click();
 
       await solicitarBtn
         .waitFor({ state: "hidden", timeout: 20_000 })
@@ -288,9 +250,8 @@ export async function checkNieSlots(
       await page
         .waitForLoadState("networkidle", { timeout: 10_000 })
         .catch(() => {});
-      await humanPause(800, 1600);
 
-      // Step 4: Verify slot availability (strict positive check only)
+      // Step 4: Verify slot availability (strict positive check)
       const bodyText = await getBodyText(page);
 
       if (URL_REJECTED_PATTERN.test(bodyText)) {
@@ -336,7 +297,6 @@ export async function checkNieSlots(
         };
       }
 
-      // Unrecognized portal screen (maintenance, unexpected error, CAPTCHA, etc.)
       const snippet = bodyText.replace(/\s+/g, " ").slice(0, 220);
       const screenshotPath = logger.getScreenshotPath("unknown");
       await page
