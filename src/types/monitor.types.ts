@@ -3,8 +3,42 @@ export type CheckStatus =
   | "NO_SLOTS"
   | "SESSION_EXPIRED"
   | "REJECTED"
+  | "IP_BLOCKED"
   | "UNKNOWN"
   | "ERROR";
+
+export type ProxyOutcome = "SUCCESS" | "REJECTED" | "IP_BLOCKED" | "ERROR";
+
+export interface ProxyRecord {
+  proxyId: string;
+  mode: "list" | "residential";
+  server: string;
+  username: string | null;
+  lastUsedAt: string | null;
+  lastOutcome: ProxyOutcome | null;
+  lastErrorAt: string | null;
+  lastErrorReason: string | null;
+  errorCount: number;
+  dailyDate: string;
+  checksToday: number;
+  cooldownUntil: string | null;
+}
+
+export interface ProxyDevLogEntry {
+  timestamp: string;
+  mode: "none" | "list" | "residential";
+  proxyId: string;
+  server: string;
+  username: string | null;
+  exitIp: string | null;
+  probeLatencyMs: number | null;
+  portalTtfbMs: number | null;
+  portalHttpStatus: number | null;
+  totalDurationMs: number;
+  outcome: ProxyOutcome;
+  targetUrl: string;
+  error?: string;
+}
 
 export type NonErrorCheckStatus = Exclude<CheckStatus, "ERROR">;
 
@@ -52,20 +86,5 @@ export interface MonitorStats {
   unknown: number;
   dailyDate: string;
   checksToday: number;
-}
-
-export interface ProxyDevLogEntry {
-  timestamp: string;
-  mode: "none" | "list" | "residential";
-  proxyId: string;
-  server: string;
-  username: string | null;
-  exitIp: string | null;
-  probeLatencyMs: number | null;
-  portalTtfbMs: number | null;
-  portalHttpStatus: number | null;
-  totalDurationMs: number;
-  outcome: "SUCCESS" | "REJECTED" | "ERROR";
-  targetUrl: string;
-  error?: string;
+  ipBlocked: number;
 }

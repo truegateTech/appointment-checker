@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "@/config/env";
+import { dbService } from "@/services/db.service";
+import type { ProxyOutcome } from "@/types/monitor.types";
 import { getMadridDateKey } from "@/utils/schedule";
 
 export interface PlaywrightProxyConfig {
@@ -27,14 +29,11 @@ interface StaticProxyState {
   checksToday: number;
   rejectedCount: number;
   cooldownUntil: number;
+  lastUsedAt: number;
 }
-
 const PROXY_COOLDOWN_MS = 30 * 60 * 1000;
+const DAILY_IP_BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-/**
- * Strips any existing Webshare suffix (-es-1, -es-rotate, -1, -rotate, -es-city_madrid-2)
- * so residential session generation never double-appends parameters.
- */
 function extractBaseUsername(raw: string): string {
   return raw
     .trim()
@@ -49,7 +48,6 @@ function parseProxyLine(line: string): StaticProxyState | null {
   const cleaned = line.trim();
   if (!cleaned || cleaned.startsWith("#")) return null;
 
-  // Webshare download list format: host:port:username:password
   const parts = cleaned.split(":");
   if (parts.length >= 4) {
     const [host, port, username, ...rest] = parts;
@@ -58,7 +56,6 @@ function parseProxyLine(line: string): StaticProxyState | null {
 
     const server = `http://${host}:${port}`;
     return {
-      // Include username so backbone entries like p.webshare.io:80:user-es-1 and user-es-2 stay distinct
       id: `${host}:${port}:${username}`,
       server,
       username,
@@ -67,10 +64,10 @@ function parseProxyLine(line: string): StaticProxyState | null {
       checksToday: 0,
       rejectedCount: 0,
       cooldownUntil: 0,
+      lastUsedAt: 0,
     };
   }
 
-  // Fallback for http://user:pass@host:port URLs
   try {
     const parsed = new URL(
       cleaned.includes("://") ? cleaned : `http://${cleaned}`,
@@ -99,6 +96,7 @@ function parseProxyLine(line: string): StaticProxyState | null {
       checksToday: 0,
       rejectedCount: 0,
       cooldownUntil: 0,
+      lastUsedAt: 0,
     };
   } catch {
     return null;
@@ -108,14 +106,18 @@ function parseProxyLine(line: string): StaticProxyState | null {
 class ProxyService {
   private staticProxies: StaticProxyState[] = [];
   private cursor = 0;
+  private lastUsedProxyId: string | null = null;
   private residentialBaseUsername: string | null = null;
   private residentialSessionCounter = Math.floor(1000 + Math.random() * 8000);
+  private readonly usedResidentialIds = new Set<string>();
 
   isEnabled(): boolean {
     return config.proxyMode !== "none";
   }
 
   async init(): Promise<void> {
+    this.lastUsedProxyId = dbService.getLastUsedProxyId();
+
     if (config.proxyMode === "none") {
       console.log("[Proxy] Disabled (PROXY_MODE=none — using CDP Chrome).");
       return;
@@ -136,7 +138,7 @@ class ProxyService {
       );
       if (cleanedBase !== config.webshareResidentialUsername.trim()) {
         console.log(
-          `[Proxy] Normalized WEBSHARE_RESIDENTIAL_USERNAME "${config.webshareResidentialUsername}" -> base "${cleanedBase}" (suffix will be generated per session).`,
+          `[Proxy] Normalized WEBSHARE_RESIDENTIAL_USERNAME "${config.webshareResidentialUsername}" -> base "${cleanedBase}".`,
         );
       }
       this.residentialBaseUsername = cleanedBase;
@@ -168,17 +170,32 @@ class ProxyService {
       rawText = fs.readFileSync(filePath, "utf8");
     }
 
+    const today = getMadridDateKey();
     this.staticProxies = rawText
       .split(/\r?\n/)
       .map(parseProxyLine)
-      .filter((p): p is StaticProxyState => p !== null);
+      .filter((p): p is StaticProxyState => p !== null)
+      .map((proxy) => {
+        const stored = dbService.getProxyRecord(proxy.id);
+        if (!stored) return proxy;
+        const parsedCooldown = stored.cooldownUntil
+          ? Date.parse(stored.cooldownUntil)
+          : 0;
+        return {
+          ...proxy,
+          dailyDate: today,
+          checksToday: stored.dailyDate === today ? stored.checksToday : 0,
+          lastUsedAt: stored.lastUsedAt ? Date.parse(stored.lastUsedAt) : 0,
+          cooldownUntil: Number.isFinite(parsedCooldown) ? parsedCooldown : 0,
+        };
+      });
 
     if (this.staticProxies.length === 0) {
       throw new Error("Webshare proxy list loaded 0 valid proxies.");
     }
 
     console.log(
-      `[Proxy] Loaded ${this.staticProxies.length} Webshare proxies (max ${config.maxChecksPerProxyPerDay} checks/IP/day = ${this.staticProxies.length * config.maxChecksPerProxyPerDay} checks/day capacity).`,
+      `[Proxy] Loaded ${this.staticProxies.length} Webshare proxies (last used: ${this.lastUsedProxyId ?? "none"}).`,
     );
   }
 
@@ -194,25 +211,41 @@ class ProxyService {
     }
   }
 
-  acquire(): SelectedProxy | null {
+  acquire(excludeIds: ReadonlySet<string> = new Set()): SelectedProxy | null {
     if (config.proxyMode === "none") return null;
 
+    const today = getMadridDateKey();
+
     if (config.proxyMode === "residential") {
-      this.residentialSessionCounter += 1;
-      const sessionId = this.residentialSessionCounter;
       const country = config.webshareResidentialCountry;
       const baseUser =
         this.residentialBaseUsername ??
         extractBaseUsername(config.webshareResidentialUsername ?? "");
-
-      // Webshare sticky session format: {baseUsername}-{country}-{sessionId}
-      const username = country
-        ? `${baseUser}-${country}-${sessionId}`
-        : `${baseUser}-${sessionId}`;
       const server = `http://${config.webshareResidentialHost}:${config.webshareResidentialPort}`;
 
-      return {
-        id: `${config.webshareResidentialHost}:${config.webshareResidentialPort}:${username}`,
+      // Keep advancing until we guarantee a unique session ID never seen before
+      let id = "";
+      let username = "";
+      do {
+        this.residentialSessionCounter += 1;
+        username = country
+          ? `${baseUser}-${country}-${this.residentialSessionCounter}`
+          : `${baseUser}-${this.residentialSessionCounter}`;
+        id = `${config.webshareResidentialHost}:${config.webshareResidentialPort}:${username}`;
+      } while (
+        id === this.lastUsedProxyId ||
+        excludeIds.has(id) ||
+        this.usedResidentialIds.has(id)
+      );
+
+      this.usedResidentialIds.add(id);
+      if (this.usedResidentialIds.size > 5000) {
+        this.usedResidentialIds.clear();
+        this.usedResidentialIds.add(id);
+      }
+
+      const selected: SelectedProxy = {
+        id,
         label: `${server} (${username})`,
         mode: "residential",
         server,
@@ -223,36 +256,65 @@ class ProxyService {
           password: config.webshareResidentialPassword ?? undefined,
         },
       };
+
+      this.lastUsedProxyId = selected.id;
+      dbService.recordProxySelected(selected, today);
+      return selected;
     }
 
+    // PROXY_MODE=list: pick a unique proxy that is under cap, cooled down, and != lastUsedProxyId
     this.resetStaleDailyCounters();
     const now = Date.now();
     const total = this.staticProxies.length;
 
-    for (let i = 0; i < total; i += 1) {
-      const idx = (this.cursor + i) % total;
-      const candidate = this.staticProxies[idx];
-      if (!candidate) continue;
+    const eligible = this.staticProxies
+      .map((proxy, index) => ({ proxy, index }))
+      .filter(({ proxy }) => {
+        if (excludeIds.has(proxy.id)) return false;
+        const underCap =
+          config.maxChecksPerProxyPerDay === 0 ||
+          proxy.checksToday < config.maxChecksPerProxyPerDay;
+        return underCap && proxy.cooldownUntil <= now;
+      });
 
-      const underDailyCap =
-        config.maxChecksPerProxyPerDay === 0 ||
-        candidate.checksToday < config.maxChecksPerProxyPerDay;
-      const cooledDown = candidate.cooldownUntil <= now;
+    if (eligible.length === 0) return null;
 
-      if (underDailyCap && cooledDown) {
-        this.cursor = (idx + 1) % total;
-        return {
-          id: candidate.id,
-          label: `${candidate.server} (${candidate.username ?? "no-auth"} | ${candidate.checksToday + 1}/${config.maxChecksPerProxyPerDay})`,
-          mode: "list",
-          server: candidate.server,
-          username: candidate.username,
-          playwrightProxy: candidate.playwrightProxy,
-        };
+    // Prefer a proxy different from lastUsedProxyId; pick least-recently-used among alternatives
+    const distinct = eligible.filter(
+      ({ proxy }) => proxy.id !== this.lastUsedProxyId,
+    );
+
+    if (distinct.length === 0) {
+      // Only the last-used proxy is eligible right now
+      if (total > 1 || excludeIds.size > 0) {
+        console.warn(
+          `[Proxy] Skipping ${this.lastUsedProxyId} to avoid back-to-back reuse.`,
+        );
+        return null;
       }
     }
 
-    return null;
+    const pool = distinct.length > 0 ? distinct : eligible;
+    pool.sort((a, b) => a.proxy.lastUsedAt - b.proxy.lastUsedAt);
+
+    const chosen = pool[0];
+    if (!chosen) return null;
+
+    chosen.proxy.lastUsedAt = now;
+    this.cursor = (chosen.index + 1) % total;
+
+    const selected: SelectedProxy = {
+      id: chosen.proxy.id,
+      label: `${chosen.proxy.server} (${chosen.proxy.username ?? "no-auth"} | ${chosen.proxy.checksToday + 1}/${config.maxChecksPerProxyPerDay})`,
+      mode: "list",
+      server: chosen.proxy.server,
+      username: chosen.proxy.username,
+      playwrightProxy: chosen.proxy.playwrightProxy,
+    };
+
+    this.lastUsedProxyId = selected.id;
+    dbService.recordProxySelected(selected, today);
+    return selected;
   }
 
   hasAvailableCapacity(): {
@@ -306,27 +368,72 @@ class ProxyService {
   }
 
   reportOutcome(
-    proxyId: string | null,
-    outcome: "SUCCESS" | "REJECTED" | "ERROR",
+    proxy: SelectedProxy | null,
+    outcome: ProxyOutcome,
+    errorReason?: string,
   ): void {
-    if (!proxyId || config.proxyMode !== "list") return;
-
-    const proxy = this.staticProxies.find((p) => p.id === proxyId);
     if (!proxy) return;
+
+    const today = getMadridDateKey();
+
+    if (config.proxyMode !== "list") {
+      const cooldownIso =
+        outcome === "IP_BLOCKED"
+          ? new Date(Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS).toISOString()
+          : null;
+      dbService.recordProxyOutcome(
+        proxy,
+        outcome,
+        today,
+        errorReason,
+        cooldownIso,
+      );
+      if (outcome === "IP_BLOCKED") {
+        console.warn(
+          `[Proxy] ${proxy.id} hit "Información" daily IP block — recorded 24h cooldown.`,
+        );
+      }
+      return;
+    }
+
+    const entry = this.staticProxies.find((p) => p.id === proxy.id);
+    if (!entry) {
+      dbService.recordProxyOutcome(proxy, outcome, today, errorReason, null);
+      return;
+    }
 
     this.resetStaleDailyCounters();
 
+    let cooldownIso: string | null = null;
+
     if (outcome === "SUCCESS") {
-      proxy.checksToday += 1;
-      proxy.rejectedCount = 0;
-    } else {
-      proxy.rejectedCount += 1;
-      const multiplier = Math.min(proxy.rejectedCount, 4);
-      proxy.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS * multiplier;
+      entry.checksToday += 1;
+      entry.rejectedCount = 0;
+      entry.cooldownUntil = 0;
+    } else if (outcome === "IP_BLOCKED") {
+      entry.rejectedCount += 1;
+      entry.cooldownUntil = Date.now() + DAILY_IP_BLOCK_COOLDOWN_MS;
+      cooldownIso = new Date(entry.cooldownUntil).toISOString();
       console.warn(
-        `[Proxy] ${proxy.id} marked ${outcome} (x${proxy.rejectedCount}) — cooling down for ${(PROXY_COOLDOWN_MS * multiplier) / 60_000} min.`,
+        `[Proxy] ${entry.id} hit "Información" daily IP block — cooling down for 24h (until ${cooldownIso}).`,
+      );
+    } else {
+      entry.rejectedCount += 1;
+      const multiplier = Math.min(entry.rejectedCount, 4);
+      entry.cooldownUntil = Date.now() + PROXY_COOLDOWN_MS * multiplier;
+      cooldownIso = new Date(entry.cooldownUntil).toISOString();
+      console.warn(
+        `[Proxy] ${entry.id} recorded ${outcome} (${errorReason ?? "no detail"}) — cooling down ${(PROXY_COOLDOWN_MS * multiplier) / 60_000} min.`,
       );
     }
+
+    dbService.recordProxyOutcome(
+      proxy,
+      outcome,
+      today,
+      errorReason,
+      cooldownIso,
+    );
   }
 }
 

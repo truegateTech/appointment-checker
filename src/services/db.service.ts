@@ -2,7 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Applicant, CreateApplicantInput } from "@/types/applicant.types";
-import type { CheckStatus } from "@/types/monitor.types";
+import type {
+  CheckStatus,
+  ProxyOutcome,
+  ProxyRecord,
+} from "@/types/monitor.types";
 
 const DB_PATH = path.resolve("data/monitor.db");
 
@@ -23,7 +27,29 @@ interface ApplicantRow {
   created_at: string;
 }
 
-function mapRow(row: ApplicantRow): Applicant {
+interface ProxyRecordRow {
+  proxy_id: string;
+  mode: "list" | "residential";
+  server: string;
+  username: string | null;
+  last_used_at: string | null;
+  last_outcome: ProxyOutcome | null;
+  last_error_at: string | null;
+  last_error_reason: string | null;
+  error_count: number;
+  daily_date: string;
+  checks_today: number;
+  cooldown_until: string | null;
+}
+
+interface ProxyIdentity {
+  id: string;
+  mode: "list" | "residential";
+  server: string;
+  username: string | null;
+}
+
+function mapApplicantRow(row: ApplicantRow): Applicant {
   return {
     id: row.id,
     fullName: row.full_name,
@@ -39,6 +65,23 @@ function mapRow(row: ApplicantRow): Applicant {
     lastStatus: row.last_status,
     lastCheckedAt: row.last_checked_at,
     createdAt: row.created_at,
+  };
+}
+
+function mapProxyRow(row: ProxyRecordRow): ProxyRecord {
+  return {
+    proxyId: row.proxy_id,
+    mode: row.mode,
+    server: row.server,
+    username: row.username,
+    lastUsedAt: row.last_used_at,
+    lastOutcome: row.last_outcome,
+    lastErrorAt: row.last_error_at,
+    lastErrorReason: row.last_error_reason,
+    errorCount: row.error_count,
+    dailyDate: row.daily_date,
+    checksToday: row.checks_today,
+    cooldownUntil: row.cooldown_until,
   };
 }
 
@@ -71,20 +114,43 @@ class DbService {
         last_checked_at TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      CREATE TABLE IF NOT EXISTS proxy_records (
+        proxy_id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        server TEXT NOT NULL,
+        username TEXT,
+        last_used_at TEXT,
+        last_outcome TEXT,
+        last_error_at TEXT,
+        last_error_reason TEXT,
+        error_count INTEGER NOT NULL DEFAULT 0,
+        daily_date TEXT NOT NULL,
+        checks_today INTEGER NOT NULL DEFAULT 0,
+        cooldown_until TEXT
+      );
     `);
 
-    const cols = this.db.prepare("PRAGMA table_info(applicants)").all() as {
-      name: string;
-    }[];
-    const names = new Set(cols.map((c) => c.name));
+    const applicantCols = this.db
+      .prepare("PRAGMA table_info(applicants)")
+      .all() as { name: string }[];
+    const applicantColNames = new Set(applicantCols.map((c) => c.name));
 
-    // Drop legacy nationality columns if upgrading an existing monitor.db
     for (const obsoleteCol of ["nationality_code", "nationality_name"]) {
-      if (names.has(obsoleteCol)) {
+      if (applicantColNames.has(obsoleteCol)) {
         this.db.exec(`ALTER TABLE applicants DROP COLUMN ${obsoleteCol}`);
       }
     }
+
+    const proxyCols = this.db
+      .prepare("PRAGMA table_info(proxy_records)")
+      .all() as { name: string }[];
+    if (!proxyCols.some((c) => c.name === "cooldown_until")) {
+      this.db.exec("ALTER TABLE proxy_records ADD COLUMN cooldown_until TEXT");
+    }
   }
+
+  // --- Applicants ---
 
   createApplicant(input: CreateApplicantInput): Applicant {
     const stmt = this.db.prepare(`
@@ -111,21 +177,21 @@ class DbService {
       chatId: input.chatId?.trim() || null,
     }) as ApplicantRow;
 
-    return mapRow(row);
+    return mapApplicantRow(row);
   }
 
   getActiveApplicants(): Applicant[] {
     const rows = this.db
       .prepare("SELECT * FROM applicants WHERE is_active = 1 ORDER BY id ASC")
       .all() as ApplicantRow[];
-    return rows.map(mapRow);
+    return rows.map(mapApplicantRow);
   }
 
   getByChatId(chatId: string): Applicant[] {
     const rows = this.db
       .prepare("SELECT * FROM applicants WHERE chat_id = ? ORDER BY id DESC")
       .all(chatId) as ApplicantRow[];
-    return rows.map(mapRow);
+    return rows.map(mapApplicantRow);
   }
 
   toggleById(id: number, chatId: string, isAdmin = false): Applicant | null {
@@ -147,7 +213,7 @@ class DbService {
           )
           .get(id, chatId) as ApplicantRow | undefined);
 
-    return row ? mapRow(row) : null;
+    return row ? mapApplicantRow(row) : null;
   }
 
   setActiveById(id: number, active: boolean): void {
@@ -172,6 +238,128 @@ class DbService {
         "UPDATE applicants SET last_status = ?, last_checked_at = ? WHERE id = ?",
       )
       .run(status, new Date().toISOString(), id);
+  }
+
+  // --- Proxy Records ---
+
+  recordProxySelected(proxy: ProxyIdentity, dailyDate: string): void {
+    const nowIso = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+        INSERT INTO proxy_records (
+          proxy_id, mode, server, username, last_used_at, daily_date, checks_today
+        )
+        VALUES (@proxyId, @mode, @server, @username, @nowIso, @dailyDate, 0)
+        ON CONFLICT(proxy_id) DO UPDATE SET
+          mode = excluded.mode,
+          server = excluded.server,
+          username = excluded.username,
+          last_used_at = excluded.last_used_at,
+          checks_today = CASE
+            WHEN proxy_records.daily_date = excluded.daily_date THEN proxy_records.checks_today
+            ELSE 0
+          END,
+          daily_date = excluded.daily_date
+      `,
+      )
+      .run({
+        proxyId: proxy.id,
+        mode: proxy.mode,
+        server: proxy.server,
+        username: proxy.username,
+        nowIso,
+        dailyDate,
+      });
+  }
+
+  recordProxyOutcome(
+    proxy: ProxyIdentity,
+    outcome: ProxyOutcome,
+    dailyDate: string,
+    errorReason?: string,
+    cooldownUntil?: string | null,
+  ): void {
+    const nowIso = new Date().toISOString();
+    const isError = outcome !== "SUCCESS";
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO proxy_records (
+          proxy_id, mode, server, username, last_used_at, last_outcome,
+          last_error_at, last_error_reason, error_count, daily_date, checks_today, cooldown_until
+        )
+        VALUES (
+          @proxyId, @mode, @server, @username, @nowIso, @outcome,
+          @lastErrorAt, @lastErrorReason, @initialErrorCount, @dailyDate, @initialChecks, @cooldownUntil
+        )
+        ON CONFLICT(proxy_id) DO UPDATE SET
+          mode = excluded.mode,
+          server = excluded.server,
+          username = excluded.username,
+          last_outcome = excluded.last_outcome,
+          last_error_at = CASE
+            WHEN @isError = 1 THEN @nowIso
+            ELSE proxy_records.last_error_at
+          END,
+          last_error_reason = CASE
+            WHEN @isError = 1 THEN @lastErrorReason
+            ELSE proxy_records.last_error_reason
+          END,
+          error_count = CASE
+            WHEN @isError = 1 THEN proxy_records.error_count + 1
+            ELSE proxy_records.error_count
+          END,
+          checks_today = CASE
+            WHEN proxy_records.daily_date = excluded.daily_date
+              THEN proxy_records.checks_today + @initialChecks
+            ELSE @initialChecks
+          END,
+          daily_date = excluded.daily_date,
+          cooldown_until = @cooldownUntil
+      `,
+      )
+      .run({
+        proxyId: proxy.id,
+        mode: proxy.mode,
+        server: proxy.server,
+        username: proxy.username,
+        nowIso,
+        outcome,
+        isError: isError ? 1 : 0,
+        lastErrorAt: isError ? nowIso : null,
+        lastErrorReason: isError ? (errorReason ?? outcome) : null,
+        initialErrorCount: isError ? 1 : 0,
+        dailyDate,
+        initialChecks: outcome === "SUCCESS" ? 1 : 0,
+        cooldownUntil: cooldownUntil ?? null,
+      });
+  }
+
+  getProxyRecord(proxyId: string): ProxyRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM proxy_records WHERE proxy_id = ?")
+      .get(proxyId) as ProxyRecordRow | undefined;
+    return row ? mapProxyRow(row) : null;
+  }
+
+  getLastUsedProxyId(): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT proxy_id FROM proxy_records WHERE last_used_at IS NOT NULL ORDER BY last_used_at DESC LIMIT 1",
+      )
+      .get() as { proxy_id: string } | undefined;
+    return row?.proxy_id ?? null;
+  }
+
+  getProxyErrors(limit = 20): ProxyRecord[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM proxy_records WHERE error_count > 0 ORDER BY last_error_at DESC LIMIT ?",
+      )
+      .all(limit) as ProxyRecordRow[];
+    return rows.map(mapProxyRow);
   }
 
   close(): void {

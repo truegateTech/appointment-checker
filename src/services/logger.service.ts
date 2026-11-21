@@ -41,6 +41,7 @@ class LoggerService {
       lastStatus: null,
       dailyDate: getMadridDateKey(),
       checksToday: 0,
+      ipBlocked: 0,
     };
   }
 
@@ -148,9 +149,13 @@ class LoggerService {
         this.stats.rejected += 1;
         this.stats.consecutiveFailures += 1;
         break;
+      case "IP_BLOCKED":
+        this.stats.ipBlocked += 1;
+        this.stats.consecutiveFailures += 1;
+        break;
     }
 
-    if (result.status !== "REJECTED") {
+    if (result.status !== "REJECTED" && result.status !== "IP_BLOCKED") {
       this.stats.checksToday += 1;
     }
 

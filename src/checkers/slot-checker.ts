@@ -1,4 +1,4 @@
-import type { Locator, Page } from "patchright";
+import type { Locator, Page, Response as PlaywrightResponse } from "patchright";
 import { config } from "@/config/env";
 import { browserService } from "@/services/browser.service";
 import { logger } from "@/services/logger.service";
@@ -9,12 +9,47 @@ import type { SlotCheckResult } from "@/types/monitor.types";
 const NO_SLOTS_MESSAGES = [
   "En este momento no hay citas disponibles.\n\nEn breve, la Oficina pondrá a su disposición nuevas citas.",
   "En este momento no hay citas disponibles para la reserva sin cl@ve.",
-  "Información: En este momento",
-  "Información: En este momento no hay citas disponibles",
+  "En este momento no hay citas disponibles",
 ];
 
 const SESSION_EXPIRED_MESSAGES = [
   "Su sesión ha caducado por permanecer demasiado tiempo inactiva. Deberás iniciar de nuevo la solicitud de la cita previa.",
+  "Su sesión ha caducado",
+  "La sesión ha expirado",
+];
+
+const ACCESS_BLOCKED_PATTERNS: RegExp[] = [
+  /The requested URL was rejected/i,
+  /please consult with your administrator/i,
+  /contact (?:your|the|an?) (?:system )?administrator/i,
+  /your support ID is/i,
+  /access (?:denied|blocked|forbidden)/i,
+  /request (?:was )?blocked/i,
+  /you don['’]t have permission to access/i,
+  /too many requests/i,
+  /acceso denegado/i,
+  /acceso bloqueado/i,
+  /petici[oó]n (?:rechazada|bloqueada)/i,
+  /demasiadas (?:peticiones|solicitudes)/i,
+  /ha superado el n[uú]mero m[aá]ximo/i,
+  /contacte con el administrador/i,
+  /p[oó]ngase en contacto con el administrador/i,
+  /\b403\s+forbidden\b/i,
+  /\b429\s+too many requests\b/i,
+];
+
+const PORTAL_ERROR_PATTERNS: RegExp[] = [
+  /se ha producido un error/i,
+  /error interno del servidor/i,
+  /el servicio no est[aá] disponible/i,
+  /temporalmente fuera de servicio/i,
+  /en mantenimiento/i,
+  /no se puede procesar su solicitud/i,
+  /service (?:temporarily )?unavailable/i,
+  /internal server error/i,
+  /bad gateway/i,
+  /gateway time-?out/i,
+  /\b50[0234]\b.*(?:error|unavailable|gateway|timeout)/i,
 ];
 
 function buildPattern(messages: string[]): RegExp {
@@ -30,7 +65,6 @@ function buildPattern(messages: string[]): RegExp {
 
 const NO_SLOTS_PATTERN = buildPattern(NO_SLOTS_MESSAGES);
 const SESSION_EXPIRED_PATTERN = buildPattern(SESSION_EXPIRED_MESSAGES);
-const URL_REJECTED_PATTERN = /The requested URL was rejected/i;
 const POSITIVE_SLOT_TEXT =
   /Seleccione una de las siguientes citas disponibles/i;
 const OFFICE_HEADING_TEXT = /Seleccione la oficina donde solicitar la cita/i;
@@ -40,20 +74,118 @@ type PositiveDetectionResult =
   | { matched: false };
 
 async function getBodyText(page: Page): Promise<string> {
-  return (await page.locator("body").innerText()).trim();
+  return (
+    await page
+      .locator("body")
+      .innerText()
+      .catch(() => "")
+  ).trim();
 }
 
-async function isRejected(page: Page): Promise<boolean> {
-  const text = await getBodyText(page);
-  return URL_REJECTED_PATTERN.test(text);
+function summarizeText(text: string, maxLen = 220): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, maxLen);
 }
 
-function rejectedResult(page: Page, step: string): SlotCheckResult {
-  return {
-    status: "REJECTED",
-    message: `Request rejected by WAF during "${step}"`,
-    url: page.url(),
-  };
+async function detectWebsiteError(
+  page: Page,
+  step: string,
+  response?: PlaywrightResponse | null,
+  preloadedBodyText?: string,
+): Promise<SlotCheckResult | null> {
+  const httpStatus = response?.status() ?? null;
+  const bodyText = preloadedBodyText ?? (await getBodyText(page));
+  const title = (await page.title().catch(() => "")).trim();
+  const combinedText = `${title}\n${bodyText}`;
+
+  // 1. Check HTTP 4xx / 5xx responses immediately
+  if (httpStatus !== null && httpStatus >= 400) {
+    const snippet = summarizeText(bodyText || title);
+    return {
+      status: "REJECTED",
+      message: `HTTP ${httpStatus} error during "${step}"`,
+      details: snippet ? `Snippet: ${snippet}` : undefined,
+      url: page.url(),
+    };
+  }
+
+  // 2. Check known WAF / access-blocked / contact-admin messages
+  const blockedMatch = ACCESS_BLOCKED_PATTERNS.find((rx) =>
+    rx.test(combinedText),
+  );
+  if (blockedMatch) {
+    return {
+      status: "REJECTED",
+      message: `Access blocked / rejected during "${step}" (${blockedMatch.source})`,
+      details: `Snippet: ${summarizeText(bodyText || title)}`,
+      url: page.url(),
+    };
+  }
+
+  // 3. Check general server/portal errors
+  const portalErrMatch = PORTAL_ERROR_PATTERNS.find((rx) =>
+    rx.test(combinedText),
+  );
+  if (portalErrMatch) {
+    return {
+      status: "REJECTED",
+      message: `Portal error page during "${step}" (${portalErrMatch.source})`,
+      details: `Snippet: ${summarizeText(bodyText || title)}`,
+      url: page.url(),
+    };
+  }
+
+  // 4. Check explicit visible portal error alert boxes
+  const errorBox = page
+    .locator('.mf-msg__error, .error-msg, [role="alert"].error')
+    .first();
+  if (await errorBox.isVisible().catch(() => false)) {
+    const errText = summarizeText(await errorBox.innerText().catch(() => ""));
+    if (errText) {
+      return {
+        status: "REJECTED",
+        message: `Portal error alert during "${step}"`,
+        details: errText,
+        url: page.url(),
+      };
+    }
+  }
+
+  return null;
+}
+
+async function hasInfoBlockHeading(
+  page: Page,
+  bodyText: string,
+): Promise<boolean> {
+  // Check visible heading / info-box title elements on the final result page
+  const headingTexts = await page
+    .locator(
+      'h1, h2, h3, h4, h5, legend, [role="heading"], .mf-msg__title, .mf-msg__info strong, .mf-msg__info b',
+    )
+    .evaluateAll((els) =>
+      els
+        .filter((el) => {
+          const style = window.getComputedStyle(el);
+          return style.display !== "none" && style.visibility !== "hidden";
+        })
+        .map((el) => (el.textContent ?? "").trim()),
+    )
+    .catch(() => [] as string[]);
+
+  if (headingTexts.some((t) => /^informaci[oó]n\s*:?$/i.test(t))) {
+    return true;
+  }
+
+  // Fallback: standalone "Información" heading line or "Información:" prefix in body text
+  const lines = bodyText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return lines.some(
+    (line) =>
+      /^informaci[oó]n\s*:?$/i.test(line) || /^informaci[oó]n\s*:/i.test(line),
+  );
 }
 
 async function findProcedureSelect(
@@ -130,7 +262,6 @@ async function detectAvailableSlot(
     return { matched: false };
   }
 
-  // 1. Direct appointment slot picker screen
   if (POSITIVE_SLOT_TEXT.test(bodyText)) {
     return {
       matched: true,
@@ -139,7 +270,6 @@ async function detectAvailableSlot(
     };
   }
 
-  // 2. Office selection screen: require visible #idSede dropdown with valid options
   const officeSelect = page.locator("select#idSede");
   if (await officeSelect.isVisible().catch(() => false)) {
     const offices = await officeSelect.locator("option").evaluateAll((opts) =>
@@ -167,7 +297,6 @@ async function detectAvailableSlot(
     }
   }
 
-  // 3. Contact details screen (reached directly when a single office is open)
   const phoneInput = page.locator("#txtTelefonoCitado");
   const emailInput = page.locator("#emailUNO");
   const hasContactForm =
@@ -195,14 +324,18 @@ export async function checkNieSlots(
     targetUrl,
     async (page) => {
       // Step 1: Load province page
-      if (page.url() === targetUrl) {
-        await page.reload({ waitUntil: "domcontentloaded" });
-      } else {
-        await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-      }
+      const initialResponse =
+        page.url() === targetUrl
+          ? await page.reload({ waitUntil: "domcontentloaded" })
+          : await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
 
-      if (await isRejected(page)) {
-        return { result: rejectedResult(page, "initial load") };
+      const loadError = await detectWebsiteError(
+        page,
+        "initial load",
+        initialResponse,
+      );
+      if (loadError) {
+        return { result: loadError };
       }
 
       // Step 2: Select procedure and submit
@@ -214,13 +347,19 @@ export async function checkNieSlots(
       await page.getByRole("button", { name: "Aceptar" }).click();
       await page.waitForLoadState("domcontentloaded");
 
-      if (await isRejected(page)) {
-        return { result: rejectedResult(page, "procedure selection") };
+      const procError = await detectWebsiteError(page, "procedure selection");
+      if (procError) {
+        return { result: procError };
       }
 
       // Step 3: Enter applicant details
       await page.locator("#btnEntrar").click();
       await page.waitForLoadState("domcontentloaded");
+
+      const enterError = await detectWebsiteError(page, "enter form");
+      if (enterError) {
+        return { result: enterError };
+      }
 
       await page
         .getByRole("textbox", { name: "* N.I.E. Campo obligatorio" })
@@ -240,6 +379,11 @@ export async function checkNieSlots(
       await page.getByRole("button", { name: "Aceptar" }).click();
       await page.waitForLoadState("domcontentloaded");
 
+      const detailsError = await detectWebsiteError(page, "applicant details");
+      if (detailsError) {
+        return { result: detailsError };
+      }
+
       const solicitarBtn = page.getByRole("button", { name: "Solicitar Cita" });
       await solicitarBtn.click();
 
@@ -251,11 +395,17 @@ export async function checkNieSlots(
         .waitForLoadState("networkidle", { timeout: 10_000 })
         .catch(() => {});
 
-      // Step 4: Verify slot availability (strict positive check)
+      // Step 4: Verify final screen
       const bodyText = await getBodyText(page);
 
-      if (URL_REJECTED_PATTERN.test(bodyText)) {
-        return { result: rejectedResult(page, "slot verification") };
+      const finalError = await detectWebsiteError(
+        page,
+        "slot verification",
+        null,
+        bodyText,
+      );
+      if (finalError) {
+        return { result: finalError };
       }
 
       if (SESSION_EXPIRED_PATTERN.test(bodyText)) {
@@ -263,6 +413,19 @@ export async function checkNieSlots(
           result: {
             status: "SESSION_EXPIRED",
             message: "Portal session expired before completing check",
+            url: page.url(),
+          },
+        };
+      }
+
+      // Heading "Información" on the final page indicates this IP is shadow-blocked for the day
+      if (await hasInfoBlockHeading(page, bodyText)) {
+        return {
+          result: {
+            status: "IP_BLOCKED",
+            message:
+              'Detected "Información" heading on final page — IP blocked for the day',
+            details: `Snippet: ${summarizeText(bodyText)}`,
             url: page.url(),
           },
         };
@@ -297,7 +460,6 @@ export async function checkNieSlots(
         };
       }
 
-      const snippet = bodyText.replace(/\s+/g, " ").slice(0, 220);
       const screenshotPath = logger.getScreenshotPath("unknown");
       await page
         .screenshot({ path: screenshotPath, fullPage: true })
@@ -308,7 +470,7 @@ export async function checkNieSlots(
           status: "UNKNOWN",
           message:
             "Unrecognized response page (no positive slot indicator found)",
-          details: `Snippet: ${snippet}`,
+          details: `Snippet: ${summarizeText(bodyText)}`,
           url: page.url(),
           screenshotPath,
         },

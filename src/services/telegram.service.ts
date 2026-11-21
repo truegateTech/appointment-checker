@@ -24,11 +24,12 @@ function withEnvPrefix(htmlText: string): string {
 }
 
 const STATUS_BADGE: Record<NonErrorCheckStatus, string> = {
-  AVAILABLE: "🚨 AVAILABLE",
-  NO_SLOTS: "ℹ️ NO SLOTS",
-  SESSION_EXPIRED: "⏳ SESSION EXPIRED",
-  REJECTED: "⛔ WAF REJECTED",
-  UNKNOWN: "❓ UNKNOWN PAGE",
+  AVAILABLE: "🚨 Slots Available",
+  NO_SLOTS: "ℹ️ No Slots",
+  SESSION_EXPIRED: "⏳ Session Expired",
+  REJECTED: "🚫 WAF / Rejected",
+  IP_BLOCKED: "🛑 IP Blocked (24h)",
+  UNKNOWN: "❓ Unknown Response",
 };
 
 class TelegramService {

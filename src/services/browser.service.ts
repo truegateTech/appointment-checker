@@ -7,6 +7,7 @@ import {
 import { config } from "@/config/env";
 import { logger } from "@/services/logger.service";
 import type { SelectedProxy } from "@/services/proxy.service";
+import { ProxyOutcome } from "@/types/monitor.types";
 
 export interface PageError extends Error {
   screenshotPath?: string;
@@ -44,18 +45,18 @@ class BrowserService {
     }
 
     if (config.proxyMode === "none") {
-      this.browser = await chromium.connectOverCDP(config.cdpUrl);
       this.isCdpMode = true;
+      this.browser = await chromium.connectOverCDP(config.cdpUrl);
     } else {
       this.isCdpMode = false;
       this.browser = await chromium.launch({
         headless: config.headless,
         channel: config.browserChannel,
         proxy: { server: "http://per-context" },
-        args: [
-          "--disable-blink-features=AutomationControlled",
-          "--start-maximized",
-        ],
+        // args: [
+        //   "--start-maximized",
+        //   "--disable-blink-features=AutomationControlled",
+        // ],
       });
     }
 
@@ -125,6 +126,7 @@ class BrowserService {
     let errorMessage: string | undefined;
 
     try {
+      let outcome: ProxyOutcome = "SUCCESS";
       const browser = await this.connect();
 
       if (this.isCdpMode) {
@@ -136,18 +138,11 @@ class BrowserService {
 
         const context = await browser.newContext({
           proxy: proxy.playwrightProxy,
-          locale: "es-ES",
-          timezoneId: "Europe/Madrid",
-          // viewport: { width: 1466, height: 740 },
+          // locale: "es-ES",
+          // timezoneId: "Europe/Madrid",
           viewport: null,
         });
         contextToClose = context;
-
-        await context.addInitScript(() => {
-          Object.defineProperty(navigator, "webdriver", {
-            get: () => undefined,
-          });
-        });
 
         if (config.blockHeavyAssets) {
           await context.route("**/*", (route) => {
@@ -159,7 +154,6 @@ class BrowserService {
           });
         }
 
-        // Dev-only lightweight probe: confirms exit IP and proxy round-trip latency
         if (config.isDev) {
           const probe = await probeProxyExit(context);
           exitIp = probe.exitIp;
@@ -170,7 +164,6 @@ class BrowserService {
         page.setDefaultTimeout(35_000);
       }
 
-      // Dev-only listener: measure first main-document response from target portal
       if (config.isDev && page) {
         const navStartedAt = Date.now();
         let captured = false;
@@ -191,7 +184,9 @@ class BrowserService {
 
       const maybeStatus = (taskOutcome.result as { status?: string } | null)
         ?.status;
-      if (maybeStatus === "REJECTED") {
+      if (maybeStatus === "IP_BLOCKED") {
+        outcome = "IP_BLOCKED";
+      } else if (maybeStatus === "REJECTED") {
         outcome = "REJECTED";
       }
 
