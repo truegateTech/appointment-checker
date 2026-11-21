@@ -43,18 +43,20 @@ class BrowserService {
       return this.browser;
     }
 
-    if (config.proxyMode === "none") {
-      this.isCdpMode = true;
-      this.browser = await chromium.connectOverCDP(config.cdpUrl);
-    } else {
-      this.isCdpMode = false;
-      this.browser = await chromium.launch({
-        headless: config.headless,
-        channel: config.browserChannel,
-        proxy: { server: "http://per-context" },
-        args: ["--disable-blink-features=AutomationControlled"],
-      });
-    }
+    this.browser = await chromium.connectOverCDP(config.cdpUrl);
+
+    // if (config.proxyMode === "none") {
+    //   this.browser = await chromium.connectOverCDP(config.cdpUrl);
+    //   this.isCdpMode = true;
+    // } else {
+    //   this.isCdpMode = false;
+    //   this.browser = await chromium.launch({
+    //     headless: config.headless,
+    //     channel: config.browserChannel,
+    //     proxy: { server: "http://per-context" },
+    //     args: ["--disable-blink-features=AutomationControlled"],
+    //   });
+    // }
 
     this.browser.on("disconnected", () => {
       this.browser = null;
