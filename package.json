@@ -20,7 +20,9 @@
     "test:report": "playwright show-report",
     "test:bot": "tsx src/scripts/test-bot-detection.ts",
     "codegen": "playwright codegen",
-    "codegen:nie": "playwright codegen --channel=chrome --lang=es-ES --timezone=Europe/Madrid"
+    "codegen:nie": "patchright codegen --channel=chrome --lang=es-ES --timezone=Europe/Madrid --user-data-dir=./user-data",
+    "capture": "tsx src/scripts/capture-site.ts",
+    "capture:record": "tsx src/scripts/capture-site.ts"
   },
   "dependencies": {
     "better-sqlite3": "^13.2.0",

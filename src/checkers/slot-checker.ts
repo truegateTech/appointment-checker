@@ -170,41 +170,78 @@ async function detectWebsiteError(
   return null;
 }
 
-async function hasInfoBlockHeading(
-  page: Page,
-  bodyText: string,
-): Promise<boolean> {
-  // Check visible heading / info-box title elements on the final result page
-  const headingTexts = await page
-    .locator(
-      'h1, h2, h3, h4, h5, legend, [role="heading"], .mf-msg__title, .mf-msg__info strong, .mf-msg__info b',
-    )
-    .evaluateAll((els) =>
-      els
-        .filter((el) => {
-          const style = window.getComputedStyle(el);
-          return style.display !== "none" && style.visibility !== "hidden";
-        })
-        .map((el) => (el.textContent ?? "").trim()),
-    )
-    .catch(() => [] as string[]);
+const PAGE_TITLE_INFO_PATTERN = /\binformaci[oó]n\b/i;
+const STEP_INDICATOR_PATTERN = /Paso\s+\d+\s+de\s+\d+/i;
+const USER_IDENTITY_PATTERN = /Identidad\s+del\s+usuario\s+de\s+cita/i;
+const COD_OPER_PATTERN = /C[oó]d\.?\s*Oper\.?\s*:?\s*([^\r\n]{3,80})?/i;
 
-  if (headingTexts.some((t) => /^informaci[oó]n\s*:?$/i.test(t))) {
-    return true;
-  }
-
-  // Fallback: standalone "Información" heading line or "Información:" prefix in body text
-  const lines = bodyText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  return lines.some(
-    (line) =>
-      /^informaci[oó]n\s*:?$/i.test(line) || /^informaci[oó]n\s*:/i.test(line),
-  );
+interface IpBlockDetectionResult {
+  blocked: boolean;
+  reason?: string;
 }
 
+async function detectDailyIpBlock(
+  page: Page,
+  bodyText: string,
+  applicant: Applicant,
+): Promise<IpBlockDetectionResult> {
+  const pageTitle = (await page.title().catch(() => "")).trim();
+  const normalizedNie = applicant.nie.trim().toUpperCase();
+
+  // 1. Genuine processed search markers — if any are present, the portal DID process the search
+  const hasStepIndicator = STEP_INDICATOR_PATTERN.test(bodyText);
+  const hasIdentitySection = USER_IDENTITY_PATTERN.test(bodyText);
+  const hasEchoedNie =
+    normalizedNie.length > 0 && bodyText.toUpperCase().includes(normalizedNie);
+  const hasSalirButton = await page
+    .getByRole("button", { name: /^Salir$/i })
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (
+    hasStepIndicator ||
+    hasIdentitySection ||
+    hasEchoedNie ||
+    hasSalirButton
+  ) {
+    return { blocked: false };
+  }
+
+  // 2. Blocked screen markers — <title> "Información", "Cod. Oper.", single "Aceptar" button
+  const hasInfoTitle = PAGE_TITLE_INFO_PATTERN.test(pageTitle);
+  const codOperMatch = bodyText.match(COD_OPER_PATTERN);
+  const hasCodOper = codOperMatch !== null;
+  const hasAceptarButton = await page
+    .getByRole("button", { name: /^Aceptar$/i })
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  const isBlocked =
+    (hasInfoTitle && (hasCodOper || hasAceptarButton)) ||
+    (hasCodOper && hasAceptarButton);
+
+  if (!isBlocked) {
+    return { blocked: false };
+  }
+
+  const codOperValue = codOperMatch?.[1]?.trim();
+  const parts = [
+    `title="${pageTitle || "(empty)"}"`,
+    codOperValue
+      ? `Cod. Oper.=${codOperValue}`
+      : hasCodOper
+        ? "Cod. Oper. present"
+        : null,
+    hasAceptarButton ? 'button="Aceptar"' : null,
+  ].filter((part): part is string => part !== null);
+
+  return {
+    blocked: true,
+    reason: parts.join(", "),
+  };
+}
 async function findProcedureSelect(
   page: Page,
   procedureCode: string,
@@ -436,12 +473,12 @@ export async function checkNieSlots(
         };
       }
 
-      if (await hasInfoBlockHeading(page, bodyText)) {
+      const ipBlock = await detectDailyIpBlock(page, bodyText, applicant);
+      if (ipBlock.blocked) {
         return {
           result: {
             status: "IP_BLOCKED",
-            message:
-              'Detected "Información" heading on final page — IP blocked for the day',
+            message: `IP blocked for 24h (${ipBlock.reason})`,
             details: `Snippet: ${summarizeText(bodyText)}`,
             url: page.url(),
             screenshotPath: await captureScreenshot(page, "ip-blocked"),
