@@ -3,7 +3,11 @@ import "dotenv/config";
 import { TelegramClient } from "teleproto";
 import { StringSession } from "teleproto/sessions";
 import { NewMessage, NewMessageEvent } from "teleproto/events";
-import { verifySlotAvailability } from "./verifier";
+import { checkNieSlots } from "./checkers/slot-checker";
+import { catalogService } from "./services/catalog.service";
+import { dbService } from "./services/db.service";
+import { telegramBot } from "./services/telegram-bot.service";
+import type { Applicant } from "./types/applicant.types";
 
 const apiId = Number(process.env.TG_API_ID);
 const apiHash = process.env.TG_API_HASH!;
@@ -29,7 +33,7 @@ function parseAlertMessage(text: string): ParsedAlert | null {
   const normalized = text.toLowerCase();
 
   // Example mapping — expand using your province/procedure ID lookup table
-  if (normalized.includes("barcelona") && normalized.includes("huellas")) {
+  if (normalized.includes("huellas")) {
     return {
       provinceId: "8", // Barcelona
       procedureId: "4010", // POLICIA-TOMA DE HUELLAS (EXPEDICIÓN DE TARJETA)
@@ -66,37 +70,80 @@ async function startListener() {
       const lastRun = recentChecks.get(key) ?? 0;
 
       if (isChecking || Date.now() - lastRun < COOLDOWN_MS) {
-        console.log(`Skipping duplicate check for ${parsed.rawLabel}`);
+        console.log(
+          `Skipping duplicate check for ${parsed.rawLabel} (cooldown / in-progress)`,
+        );
         return;
       }
+
+      // Pick first active applicant from SQLite DB
+      const applicants = dbService.getActiveApplicants();
+      if (applicants.length === 0) {
+        console.log(
+          "No active applicants found in SQLite DB. Cannot verify alert.",
+        );
+        return;
+      }
+
+      const applicant = applicants[0];
+      if (!applicant) return;
+
+      const prov = catalogService.getProvince(parsed.provinceId);
+      const proc = catalogService.getProcedure(
+        parsed.provinceId,
+        parsed.procedureId,
+      );
+
+      const targetApplicant: Applicant = {
+        ...applicant,
+        provinceCode: parsed.provinceId || applicant.provinceCode,
+        provinceName: prov?.name || applicant.provinceName,
+        provinceUrl: prov?.url || applicant.provinceUrl,
+        procedureCode: parsed.procedureId || applicant.procedureCode,
+        procedureName: proc?.name || applicant.procedureName,
+        procedureGroup: proc?.selectName || applicant.procedureGroup,
+      };
 
       isChecking = true;
       recentChecks.set(key, Date.now());
 
       try {
-        console.log(`Alert received for ${parsed.rawLabel}. Verifying live...`);
-        const result = await verifySlotAvailability(parsed);
+        console.log(
+          `Alert received for ${parsed.rawLabel}. Verifying live with checkNieSlots for applicant ${applicant.fullName} (${applicant.nie})...`,
+        );
 
-        if (result.available) {
-          // Send confirmed alert to your own Saved Messages ("me") or via a Bot API webhook
-          await client.sendMessage("me", {
-            message: `CONFIRMED LIVE: ${parsed.rawLabel}\nVerified at: ${new Date().toISOString()}`,
-            file: result.screenshotPath,
-          });
-        } else {
-          console.log(
-            `False alarm / already gone for ${parsed.rawLabel}: ${result.reason}`,
-          );
-        }
+        // Check once, no proxy needed. Tab stays open via KEEP_TAB_ON_SLOT=true in env.
+        const result = await checkNieSlots(targetApplicant, null);
+
+        dbService.recordApplicantCheck(applicant.id, result.status);
+
+        const isGenuine = result.status === "AVAILABLE";
+
+        console.log(
+          `Verification result for ${parsed.rawLabel}: status=${result.status}, genuine=${isGenuine}`,
+        );
+
+        // Send notification via dedicated alert bot (uses ALERT_BOT_TOKEN)
+        await telegramBot.sendAlertNotification({
+          rawLabel: parsed.rawLabel,
+          isGenuine,
+          result,
+          applicant,
+        });
       } catch (err) {
-        console.error("Verification failed:", err);
+        console.error(`Verification failed for ${parsed.rawLabel}:`, err);
+        await telegramBot.sendVerificationError({
+          rawLabel: parsed.rawLabel,
+          error: err,
+          chatId: applicant.chatId,
+        });
       } finally {
         isChecking = false;
       }
     },
     new NewMessage({
       incoming: true,
-      chats: [ALERT_SOURCE],
+      chats: ALERT_SOURCE ? [ALERT_SOURCE] : undefined,
     }),
   );
 }

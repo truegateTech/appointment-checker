@@ -1,8 +1,12 @@
+import fs from "node:fs";
+import path from "node:path";
 import { config } from "@/config/env";
 import { catalogService } from "@/services/catalog.service";
 import { dbService } from "@/services/db.service";
 import { logger } from "@/services/logger.service";
 import { escapeHtml, telegram } from "@/services/telegram.service";
+import type { Applicant } from "@/types/applicant.types";
+import type { SlotCheckResult } from "@/types/monitor.types";
 import type {
   TelegramInlineButton,
   TelegramUpdate,
@@ -10,6 +14,7 @@ import type {
 } from "@/types/telegram.types";
 
 const PAGE_SIZE = 6;
+const MAX_CAPTION_LENGTH = 1024;
 
 class TelegramBotService {
   private readonly drafts = new Map<string, WizardDraft>();
@@ -362,6 +367,202 @@ class TelegramBotService {
         ],
       );
     }
+  }
+
+  // ── Self-contained alert notification via dedicated ALERT_BOT_TOKEN ──
+  // These methods do NOT modify or depend on TelegramService internals (OCP).
+  // They use their own HTTP calls with the alert bot token, keeping SRP intact.
+
+  private get alertBotToken(): string {
+    return process.env.ALERT_BOT_TOKEN || config.telegramBotToken;
+  }
+
+  private get alertApiBase(): string {
+    return `https://api.telegram.org/bot${this.alertBotToken}`;
+  }
+
+  private async postAlertJson(
+    method: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.alertBotToken) return;
+
+    const response = await fetch(`${this.alertApiBase}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(
+        `Alert bot ${method} failed (${response.status}): ${body}`,
+      );
+    }
+  }
+
+  private async sendAlertPhoto(
+    chatId: string,
+    filePath: string,
+    captionHtml?: string,
+    disableNotification?: boolean,
+  ): Promise<void> {
+    if (!this.alertBotToken) return;
+
+    const buffer = fs.readFileSync(filePath);
+    const form = new FormData();
+    form.append("chat_id", chatId);
+    form.append(
+      "photo",
+      new Blob([buffer], { type: "image/png" }),
+      path.basename(filePath),
+    );
+
+    if (captionHtml) {
+      form.append("caption", captionHtml);
+      form.append("parse_mode", "HTML");
+    }
+
+    if (disableNotification) {
+      form.append("disable_notification", "true");
+    }
+
+    const response = await fetch(`${this.alertApiBase}/sendPhoto`, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(25_000),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(
+        `Alert bot sendPhoto failed (${response.status}): ${body}`,
+      );
+    }
+  }
+
+  private async sendAlertMessage(
+    chatId: string,
+    html: string,
+    options?: {
+      screenshotPath?: string | null;
+      disableNotification?: boolean;
+    },
+  ): Promise<void> {
+    const screenshotPath = options?.screenshotPath;
+
+    if (screenshotPath && fs.existsSync(screenshotPath)) {
+      try {
+        if (html.length <= MAX_CAPTION_LENGTH) {
+          await this.sendAlertPhoto(
+            chatId,
+            screenshotPath,
+            html,
+            options?.disableNotification,
+          );
+          return;
+        }
+
+        await this.sendAlertPhoto(
+          chatId,
+          screenshotPath,
+          undefined,
+          options?.disableNotification,
+        );
+      } catch (err) {
+        console.error(
+          "[AlertBot] Photo upload failed, falling back to text:",
+          err,
+        );
+      }
+    }
+
+    await this.postAlertJson("sendMessage", {
+      chat_id: chatId,
+      text: html,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      ...(options?.disableNotification ? { disable_notification: true } : {}),
+    });
+  }
+
+  async sendAlertNotification(params: {
+    rawLabel: string;
+    isGenuine: boolean;
+    result: SlotCheckResult;
+    applicant: Applicant;
+  }): Promise<void> {
+    const { rawLabel, isGenuine, result, applicant } = params;
+    const verifiedAt = new Date().toISOString();
+    const applicantLabel = `${applicant.fullName} (${applicant.nie})`;
+
+    const htmlMessage = isGenuine
+      ? [
+          `<b>🚨 ALERT CONFIRMED: GENUINE SLOTS FOUND!</b>`,
+          `<b>Target:</b> ${escapeHtml(rawLabel)}`,
+          `<b>Status:</b> ${escapeHtml(result.message)}`,
+          result.details
+            ? `<b>Details:</b> ${escapeHtml(result.details)}`
+            : null,
+          `<b>URL:</b> ${escapeHtml(result.url)}`,
+          `<b>Applicant:</b> ${escapeHtml(applicantLabel)}`,
+          `<b>Verified At:</b> ${verifiedAt}`,
+        ]
+          .filter((line): line is string => line !== null)
+          .join("\n")
+      : [
+          `<b>⚠️ ALERT VERIFIED: FAKE / NO SLOTS</b>`,
+          `<b>Target:</b> ${escapeHtml(rawLabel)}`,
+          `<b>Result:</b> ${escapeHtml(result.message)}`,
+          `<b>Status:</b> <code>${escapeHtml(result.status)}</code>`,
+          result.details
+            ? `<b>Details:</b> ${escapeHtml(result.details)}`
+            : null,
+          `<b>URL:</b> ${escapeHtml(result.url)}`,
+          `<b>Applicant:</b> ${escapeHtml(applicantLabel)}`,
+          `<b>Checked At:</b> ${verifiedAt}`,
+        ]
+          .filter((line): line is string => line !== null)
+          .join("\n");
+
+    const recipientChatId = applicant.chatId ?? config.telegramChatId;
+    await this.sendAlertMessage(recipientChatId, htmlMessage, {
+      screenshotPath: result.screenshotPath,
+      disableNotification: !isGenuine,
+    });
+
+    // Send admin copy if the recipient is not the admin
+    if (
+      recipientChatId &&
+      config.telegramChatId &&
+      recipientChatId !== config.telegramChatId
+    ) {
+      await this.sendAlertMessage(
+        config.telegramChatId,
+        `<b>[Admin Copy]</b>\n${htmlMessage}`,
+        {
+          screenshotPath: result.screenshotPath,
+          disableNotification: !isGenuine,
+        },
+      ).catch(() => {});
+    }
+  }
+
+  async sendVerificationError(params: {
+    rawLabel: string;
+    error: unknown;
+    chatId?: string | null;
+  }): Promise<void> {
+    const errMessage =
+      params.error instanceof Error
+        ? params.error.message
+        : String(params.error);
+    const targetChatId = params.chatId ?? config.telegramChatId;
+    await this.sendAlertMessage(
+      targetChatId,
+      `<b>❌ Verification Error for ${escapeHtml(params.rawLabel)}</b>\n<code>${escapeHtml(errMessage)}</code>`,
+    ).catch(() => {});
   }
 }
 
